@@ -8,5 +8,8 @@ fn main() {
         .arg(&output)
         .status()
         .expect("nvcc must be available on PATH");
-    assert!(status.success(), "nvcc failed to compile vector_add_kernel.cu");
+    assert!(
+        status.success(),
+        "nvcc failed to compile vector_add_kernel.cu"
+    );
 }

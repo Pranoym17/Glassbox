@@ -19,15 +19,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut d_result = stream.alloc_zeros::<f32>(n)?;
     let threads_per_block = 256_u32;
     let config = LaunchConfig {
-        grid_dim: (((n as u32) + threads_per_block - 1) / threads_per_block, 1, 1),
+        grid_dim: (
+            ((n as u32) + threads_per_block - 1) / threads_per_block,
+            1,
+            1,
+        ),
         block_dim: (threads_per_block, 1, 1),
         shared_mem_bytes: 0,
     };
 
     // Safe ownership/lifetimes are tracked by cudarc; kernel ABI remains the caller's responsibility.
     unsafe {
-        stream.launch_builder(&function)
-            .arg(&d_a).arg(&d_b).arg(&mut d_result).arg(&(n as u64))
+        stream
+            .launch_builder(&function)
+            .arg(&d_a)
+            .arg(&d_b)
+            .arg(&mut d_result)
+            .arg(&(n as u64))
             .launch(config)?;
     }
     let result = stream.clone_dtoh(&d_result)?;
