@@ -1,5 +1,7 @@
 use crate::Tensor;
 use crate::autograd::{Tape, TapeError, TensorId};
+use crate::transformer::causal_attention_tape;
+use std::fmt;
 
 pub trait Module {
     type Input;
@@ -142,6 +144,221 @@ impl Module for Embedding {
     }
 }
 
+#[derive(Debug)]
+pub enum GptError {
+    Tape(TapeError),
+    UnsupportedHeadCount(usize),
+    InvalidConfiguration(&'static str),
+    EmptyBatch,
+    EmptySequence,
+    RaggedBatch,
+    SequenceTooLong { length: usize, block_size: usize },
+}
+
+impl fmt::Display for GptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tape(error) => write!(f, "{error}"),
+            Self::UnsupportedHeadCount(count) => {
+                write!(
+                    f,
+                    "this GPT implementation supports n_head=1, received {count}"
+                )
+            }
+            Self::InvalidConfiguration(message) => write!(f, "{message}"),
+            Self::EmptyBatch => write!(f, "token batch must not be empty"),
+            Self::EmptySequence => write!(f, "token sequences must not be empty"),
+            Self::RaggedBatch => write!(f, "all token sequences must have the same length"),
+            Self::SequenceTooLong { length, block_size } => {
+                write!(
+                    f,
+                    "sequence length {length} exceeds block size {block_size}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for GptError {}
+
+impl From<TapeError> for GptError {
+    fn from(error: TapeError) -> Self {
+        Self::Tape(error)
+    }
+}
+
+struct TransformerBlock {
+    first_norm: LayerNorm,
+    query: Linear,
+    key: Linear,
+    value: Linear,
+    attention_output: Linear,
+    second_norm: LayerNorm,
+    mlp_input: Linear,
+    mlp_output: Linear,
+}
+
+impl TransformerBlock {
+    fn new(
+        tape: &mut Tape,
+        features: usize,
+        initializer: &mut Initializer,
+    ) -> Result<Self, TapeError> {
+        Ok(Self {
+            first_norm: LayerNorm::new(tape, features, 1e-5)?,
+            query: Linear::new(tape, features, features, initializer)?,
+            key: Linear::new(tape, features, features, initializer)?,
+            value: Linear::new(tape, features, features, initializer)?,
+            attention_output: Linear::new(tape, features, features, initializer)?,
+            second_norm: LayerNorm::new(tape, features, 1e-5)?,
+            mlp_input: Linear::new(tape, features, features * 4, initializer)?,
+            mlp_output: Linear::new(tape, features * 4, features, initializer)?,
+        })
+    }
+
+    fn parameters(&self) -> Vec<TensorId> {
+        let mut parameters = self.first_norm.parameters();
+        parameters.extend(self.query.parameters());
+        parameters.extend(self.key.parameters());
+        parameters.extend(self.value.parameters());
+        parameters.extend(self.attention_output.parameters());
+        parameters.extend(self.second_norm.parameters());
+        parameters.extend(self.mlp_input.parameters());
+        parameters.extend(self.mlp_output.parameters());
+        parameters
+    }
+
+    fn forward(&self, tape: &mut Tape, input: TensorId) -> Result<TensorId, TapeError> {
+        let normalized = self.first_norm.forward(tape, input)?;
+        let query = self.query.forward(tape, normalized)?;
+        let key = self.key.forward(tape, normalized)?;
+        let value = self.value.forward(tape, normalized)?;
+        let attention = causal_attention_tape(tape, query, key, value)?;
+        let attention = self.attention_output.forward(tape, attention)?;
+        let residual = tape.add(input, attention)?;
+        let normalized = self.second_norm.forward(tape, residual)?;
+        let hidden = self.mlp_input.forward(tape, normalized)?;
+        let hidden = tape.gelu(hidden)?;
+        let output = self.mlp_output.forward(tape, hidden)?;
+        tape.add(residual, output)
+    }
+}
+
+pub struct Gpt {
+    tape: Tape,
+    token_embedding: Embedding,
+    position_embedding: Embedding,
+    blocks: Vec<TransformerBlock>,
+    final_norm: LayerNorm,
+    output: Linear,
+    vocab_size: usize,
+    block_size: usize,
+}
+
+impl Gpt {
+    pub fn new(
+        vocab_size: usize,
+        block_size: usize,
+        n_layer: usize,
+        n_head: usize,
+        n_embd: usize,
+    ) -> Result<Self, GptError> {
+        Self::new_with_seed(vocab_size, block_size, n_layer, n_head, n_embd, 1337)
+    }
+
+    pub fn new_with_seed(
+        vocab_size: usize,
+        block_size: usize,
+        n_layer: usize,
+        n_head: usize,
+        n_embd: usize,
+        seed: u64,
+    ) -> Result<Self, GptError> {
+        if n_head != 1 {
+            return Err(GptError::UnsupportedHeadCount(n_head));
+        }
+        if vocab_size == 0 || block_size == 0 || n_embd == 0 {
+            return Err(GptError::InvalidConfiguration(
+                "vocab_size, block_size, and n_embd must be positive",
+            ));
+        }
+        let mut tape = Tape::new();
+        let mut initializer = Initializer::new(seed);
+        let token_embedding = Embedding::new(&mut tape, vocab_size, n_embd, &mut initializer)?;
+        let position_embedding = Embedding::new(&mut tape, block_size, n_embd, &mut initializer)?;
+        let blocks = (0..n_layer)
+            .map(|_| TransformerBlock::new(&mut tape, n_embd, &mut initializer))
+            .collect::<Result<Vec<_>, _>>()?;
+        let final_norm = LayerNorm::new(&mut tape, n_embd, 1e-5)?;
+        let output = Linear::new(&mut tape, n_embd, vocab_size, &mut initializer)?;
+        Ok(Self {
+            tape,
+            token_embedding,
+            position_embedding,
+            blocks,
+            final_norm,
+            output,
+            vocab_size,
+            block_size,
+        })
+    }
+
+    pub fn parameters(&self) -> Vec<TensorId> {
+        let mut parameters = self.token_embedding.parameters();
+        parameters.extend(self.position_embedding.parameters());
+        for block in &self.blocks {
+            parameters.extend(block.parameters());
+        }
+        parameters.extend(self.final_norm.parameters());
+        parameters.extend(self.output.parameters());
+        parameters
+    }
+
+    pub fn forward(&mut self, tokens: &[Vec<usize>]) -> Result<Tensor, GptError> {
+        let Some(first) = tokens.first() else {
+            return Err(GptError::EmptyBatch);
+        };
+        if first.is_empty() {
+            return Err(GptError::EmptySequence);
+        }
+        let sequence_length = first.len();
+        if tokens
+            .iter()
+            .any(|sequence| sequence.len() != sequence_length)
+        {
+            return Err(GptError::RaggedBatch);
+        }
+        if sequence_length > self.block_size {
+            return Err(GptError::SequenceTooLong {
+                length: sequence_length,
+                block_size: self.block_size,
+            });
+        }
+
+        let mut logits = Vec::with_capacity(tokens.len() * sequence_length * self.vocab_size);
+        let positions: Vec<usize> = (0..sequence_length).collect();
+        for sequence in tokens {
+            let token_values = self
+                .token_embedding
+                .forward(&mut self.tape, sequence.clone())?;
+            let position_values = self
+                .position_embedding
+                .forward(&mut self.tape, positions.clone())?;
+            let mut hidden = self.tape.add(token_values, position_values)?;
+            for block in &self.blocks {
+                hidden = block.forward(&mut self.tape, hidden)?;
+            }
+            hidden = self.final_norm.forward(&mut self.tape, hidden)?;
+            let output = self.output.forward(&mut self.tape, hidden)?;
+            logits.extend_from_slice(self.tape.value(output)?.data());
+        }
+        Ok(
+            Tensor::from_vec(vec![tokens.len(), sequence_length, self.vocab_size], logits)
+                .map_err(TapeError::from)?,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +396,36 @@ mod tests {
         assert_eq!(embedding.parameters().len(), 1);
         assert_eq!(norm.parameters().len(), 2);
         assert_eq!(linear.parameters().len(), 2);
+    }
+
+    #[test]
+    fn gpt_forward_has_batch_sequence_vocab_shape() {
+        let mut model = Gpt::new(65, 16, 2, 1, 8).unwrap();
+        let tokens = vec![
+            (0..16).map(|index| (index * 7) % 65).collect(),
+            (0..16).map(|index| (index * 11 + 3) % 65).collect(),
+        ];
+        let logits = model.forward(&tokens).unwrap();
+        assert_eq!(logits.shape(), &[2, 16, 65]);
+        assert!(logits.data().iter().all(|value| value.is_finite()));
+        assert_eq!(model.parameters().len(), 38);
+    }
+
+    #[test]
+    fn gpt_rejects_unsupported_heads_and_invalid_batches() {
+        assert!(matches!(
+            Gpt::new(65, 16, 1, 2, 8),
+            Err(GptError::UnsupportedHeadCount(2))
+        ));
+        let mut model = Gpt::new(65, 16, 1, 1, 8).unwrap();
+        assert!(matches!(model.forward(&[]), Err(GptError::EmptyBatch)));
+        assert!(matches!(
+            model.forward(&[vec![1, 2], vec![3]]),
+            Err(GptError::RaggedBatch)
+        ));
+        assert!(matches!(
+            model.forward(&[vec![0; 17]]),
+            Err(GptError::SequenceTooLong { .. })
+        ));
     }
 }
