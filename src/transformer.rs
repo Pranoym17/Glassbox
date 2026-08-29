@@ -170,7 +170,7 @@ mod layer_tests {
         let b = Tensor::from_vec(vec![3], vec![0.1, 0.2, -0.1]).unwrap();
         let dy = Tensor::from_vec(vec![2, 3], vec![0.3, -0.2, 0.5, -0.1, 0.6, 0.2]).unwrap();
         let (_, c) = layer_norm(&x, &g, &b, 1e-5).unwrap();
-        let (dx, _, _) = layer_norm_backward(&dy, &c, &g, 1e-5).unwrap();
+        let (dx, dg, db) = layer_norm_backward(&dy, &c, &g, 1e-5).unwrap();
         let e = 1e-3;
         for k in 0..6 {
             let mut p = x.data().to_vec();
@@ -188,6 +188,42 @@ mod layer_tests {
                     .sum()
             };
             assert!((dx.data()[k] - (f(p) - f(n)) / (2. * e)).abs() < 5e-3)
+        }
+        for k in 0..3 {
+            let mut plus = g.data().to_vec();
+            let mut minus = plus.clone();
+            plus[k] += e;
+            minus[k] -= e;
+            let evaluate = |values: Vec<f32>| -> f32 {
+                layer_norm(&x, &Tensor::from_vec(vec![3], values).unwrap(), &b, 1e-5)
+                    .unwrap()
+                    .0
+                    .data()
+                    .iter()
+                    .zip(dy.data())
+                    .map(|(a, b)| a * b)
+                    .sum()
+            };
+            let numerical = (evaluate(plus) - evaluate(minus)) / (2.0 * e);
+            assert!((dg.data()[k] - numerical).abs() < 5e-3);
+        }
+        for k in 0..3 {
+            let mut plus = b.data().to_vec();
+            let mut minus = plus.clone();
+            plus[k] += e;
+            minus[k] -= e;
+            let evaluate = |values: Vec<f32>| -> f32 {
+                layer_norm(&x, &g, &Tensor::from_vec(vec![3], values).unwrap(), 1e-5)
+                    .unwrap()
+                    .0
+                    .data()
+                    .iter()
+                    .zip(dy.data())
+                    .map(|(a, b)| a * b)
+                    .sum()
+            };
+            let numerical = (evaluate(plus) - evaluate(minus)) / (2.0 * e);
+            assert!((db.data()[k] - numerical).abs() < 5e-3);
         }
     }
 }

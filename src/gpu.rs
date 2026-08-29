@@ -84,6 +84,79 @@ impl CudaBackend {
     pub fn log(&self, input: &Tensor) -> Result<Tensor, GpuError> {
         self.unary("log_kernel", input)
     }
+    pub fn softmax(&self, input: &Tensor) -> Result<Tensor, GpuError> {
+        if input.shape().len() != 2 {
+            return Err(TensorError::RankMismatch {
+                expected: 2,
+                actual: input.shape().len(),
+            }
+            .into());
+        }
+        let input = input.contiguous();
+        let (rows, columns) = (input.shape()[0], input.shape()[1]);
+        let device_input = self.stream.clone_htod(input.data())?;
+        let mut device_output = self.stream.alloc_zeros::<f32>(input.data().len())?;
+        let function = self.module.load_function("softmax_rows")?;
+        unsafe {
+            self.stream
+                .launch_builder(&function)
+                .arg(&device_input)
+                .arg(&mut device_output)
+                .arg(&(rows as u64))
+                .arg(&(columns as u64))
+                .launch(row_config(rows))?;
+        }
+        Ok(Tensor::from_vec(
+            input.shape().to_vec(),
+            self.stream.clone_dtoh(&device_output)?,
+        )?)
+    }
+
+    pub fn layer_norm(
+        &self,
+        input: &Tensor,
+        gamma: &Tensor,
+        beta: &Tensor,
+        epsilon: f32,
+    ) -> Result<Tensor, GpuError> {
+        if input.shape().len() != 2 {
+            return Err(TensorError::RankMismatch {
+                expected: 2,
+                actual: input.shape().len(),
+            }
+            .into());
+        }
+        let input = input.contiguous();
+        let (rows, columns) = (input.shape()[0], input.shape()[1]);
+        if gamma.shape() != [columns] || beta.shape() != [columns] {
+            return Err(TensorError::IncompatibleShapes {
+                left: gamma.shape().to_vec(),
+                right: beta.shape().to_vec(),
+            }
+            .into());
+        }
+        let device_input = self.stream.clone_htod(input.data())?;
+        let device_gamma = self.stream.clone_htod(gamma.data())?;
+        let device_beta = self.stream.clone_htod(beta.data())?;
+        let mut device_output = self.stream.alloc_zeros::<f32>(input.data().len())?;
+        let function = self.module.load_function("layer_norm_rows")?;
+        unsafe {
+            self.stream
+                .launch_builder(&function)
+                .arg(&device_input)
+                .arg(&device_gamma)
+                .arg(&device_beta)
+                .arg(&mut device_output)
+                .arg(&(rows as u64))
+                .arg(&(columns as u64))
+                .arg(&epsilon)
+                .launch(row_config(rows))?;
+        }
+        Ok(Tensor::from_vec(
+            input.shape().to_vec(),
+            self.stream.clone_dtoh(&device_output)?,
+        )?)
+    }
 
     pub fn matmul(&self, left: &Tensor, right: &Tensor) -> Result<Tensor, GpuError> {
         if left.shape().len() != 2
@@ -241,6 +314,14 @@ fn elementwise_config(count: usize) -> LaunchConfig {
     }
 }
 
+fn row_config(rows: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (THREADS_PER_BLOCK, 1, 1),
+        shared_mem_bytes: THREADS_PER_BLOCK * std::mem::size_of::<f32>() as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::CudaBackend;
@@ -347,5 +428,35 @@ mod tests {
                 &left.matmul(&right).unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn gpu_softmax_and_layer_norm_match_cpu() {
+        use crate::transformer::{layer_norm, softmax};
+
+        let backend = CudaBackend::new().unwrap();
+        let input = Tensor::from_vec(
+            vec![4, 8],
+            (0..32)
+                .map(|index| (index % 11) as f32 * 0.17 - 0.8)
+                .collect(),
+        )
+        .unwrap();
+        let gamma = Tensor::from_vec(
+            vec![8],
+            (0..8).map(|index| 0.7 + index as f32 * 0.06).collect(),
+        )
+        .unwrap();
+        let beta = Tensor::from_vec(
+            vec![8],
+            (0..8).map(|index| index as f32 * 0.03 - 0.1).collect(),
+        )
+        .unwrap();
+
+        assert_close(&backend.softmax(&input).unwrap(), &softmax(&input).unwrap());
+        assert_close(
+            &backend.layer_norm(&input, &gamma, &beta, 1e-5).unwrap(),
+            &layer_norm(&input, &gamma, &beta, 1e-5).unwrap().0,
+        );
     }
 }

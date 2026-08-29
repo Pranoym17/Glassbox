@@ -83,3 +83,78 @@ extern "C" __global__ void matmul_naive(
     }
     output[row * columns + column] = sum;
 }
+
+extern "C" __global__ void softmax_rows(
+    const float* input, float* output, unsigned long long rows, unsigned long long columns
+) {
+    extern __shared__ float shared[];
+    const unsigned int thread = threadIdx.x;
+    const unsigned long long row = blockIdx.x;
+    if (row >= rows) return;
+
+    float local_max = -3.402823466e+38F;
+    for (unsigned long long column = thread; column < columns; column += blockDim.x) {
+        local_max = fmaxf(local_max, input[row * columns + column]);
+    }
+    shared[thread] = local_max;
+    __syncthreads();
+    for (unsigned int width = blockDim.x / 2; width > 0; width /= 2) {
+        if (thread < width) shared[thread] = fmaxf(shared[thread], shared[thread + width]);
+        __syncthreads();
+    }
+    const float maximum = shared[0];
+
+    float local_sum = 0.0f;
+    for (unsigned long long column = thread; column < columns; column += blockDim.x) {
+        local_sum += expf(input[row * columns + column] - maximum);
+    }
+    shared[thread] = local_sum;
+    __syncthreads();
+    for (unsigned int width = blockDim.x / 2; width > 0; width /= 2) {
+        if (thread < width) shared[thread] += shared[thread + width];
+        __syncthreads();
+    }
+    const float sum = shared[0];
+    for (unsigned long long column = thread; column < columns; column += blockDim.x) {
+        output[row * columns + column] = expf(input[row * columns + column] - maximum) / sum;
+    }
+}
+
+extern "C" __global__ void layer_norm_rows(
+    const float* input, const float* gamma, const float* beta, float* output,
+    unsigned long long rows, unsigned long long columns, float epsilon
+) {
+    extern __shared__ float shared[];
+    const unsigned int thread = threadIdx.x;
+    const unsigned long long row = blockIdx.x;
+    if (row >= rows) return;
+
+    float local_sum = 0.0f;
+    for (unsigned long long column = thread; column < columns; column += blockDim.x) {
+        local_sum += input[row * columns + column];
+    }
+    shared[thread] = local_sum;
+    __syncthreads();
+    for (unsigned int width = blockDim.x / 2; width > 0; width /= 2) {
+        if (thread < width) shared[thread] += shared[thread + width];
+        __syncthreads();
+    }
+    const float mean = shared[0] / static_cast<float>(columns);
+
+    float local_variance = 0.0f;
+    for (unsigned long long column = thread; column < columns; column += blockDim.x) {
+        const float centered = input[row * columns + column] - mean;
+        local_variance += centered * centered;
+    }
+    shared[thread] = local_variance;
+    __syncthreads();
+    for (unsigned int width = blockDim.x / 2; width > 0; width /= 2) {
+        if (thread < width) shared[thread] += shared[thread + width];
+        __syncthreads();
+    }
+    const float inverse_std = rsqrtf(shared[0] / static_cast<float>(columns) + epsilon);
+    for (unsigned long long column = thread; column < columns; column += blockDim.x) {
+        const float normalized = (input[row * columns + column] - mean) * inverse_std;
+        output[row * columns + column] = normalized * gamma[column] + beta[column];
+    }
+}
