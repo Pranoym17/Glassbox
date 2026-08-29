@@ -8,6 +8,7 @@ use cudarc::{
 use crate::{Tensor, TensorError};
 
 const THREADS_PER_BLOCK: u32 = 256;
+const _: () = assert!(THREADS_PER_BLOCK.is_power_of_two());
 
 pub struct CudaBackend {
     context: Arc<CudaContext>,
@@ -435,28 +436,35 @@ mod tests {
         use crate::transformer::{layer_norm, softmax};
 
         let backend = CudaBackend::new().unwrap();
-        let input = Tensor::from_vec(
-            vec![4, 8],
-            (0..32)
-                .map(|index| (index % 11) as f32 * 0.17 - 0.8)
-                .collect(),
-        )
-        .unwrap();
-        let gamma = Tensor::from_vec(
-            vec![8],
-            (0..8).map(|index| 0.7 + index as f32 * 0.06).collect(),
-        )
-        .unwrap();
-        let beta = Tensor::from_vec(
-            vec![8],
-            (0..8).map(|index| index as f32 * 0.03 - 0.1).collect(),
-        )
-        .unwrap();
+        for columns in [8, 513] {
+            let rows = 3;
+            let input = Tensor::from_vec(
+                vec![rows, columns],
+                (0..rows * columns)
+                    .map(|index| (index % 37) as f32 * 0.07 - 1.1)
+                    .collect(),
+            )
+            .unwrap();
+            let gamma = Tensor::from_vec(
+                vec![columns],
+                (0..columns)
+                    .map(|index| 0.7 + (index % 13) as f32 * 0.02)
+                    .collect(),
+            )
+            .unwrap();
+            let beta = Tensor::from_vec(
+                vec![columns],
+                (0..columns)
+                    .map(|index| (index % 17) as f32 * 0.01 - 0.08)
+                    .collect(),
+            )
+            .unwrap();
 
-        assert_close(&backend.softmax(&input).unwrap(), &softmax(&input).unwrap());
-        assert_close(
-            &backend.layer_norm(&input, &gamma, &beta, 1e-5).unwrap(),
-            &layer_norm(&input, &gamma, &beta, 1e-5).unwrap().0,
-        );
+            assert_close(&backend.softmax(&input).unwrap(), &softmax(&input).unwrap());
+            assert_close(
+                &backend.layer_norm(&input, &gamma, &beta, 1e-5).unwrap(),
+                &layer_norm(&input, &gamma, &beta, 1e-5).unwrap().0,
+            );
+        }
     }
 }
