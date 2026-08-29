@@ -2,6 +2,7 @@ use std::fmt;
 
 pub mod autograd;
 pub mod gpu;
+pub mod transformer;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tensor {
