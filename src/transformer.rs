@@ -190,3 +190,40 @@ mod layer_tests {
         }
     }
 }
+pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, TensorError> {
+    let (s, d) = dims(q)?;
+    if k.shape() != [s, d] || v.shape() != [s, d] {
+        return Err(TensorError::IncompatibleShapes {
+            left: q.shape().to_vec(),
+            right: k.shape().to_vec(),
+        });
+    }
+    let kt = k.permute(&[1, 0])?;
+    let scores = q.matmul(&kt)?;
+    let scale = (d as f32).sqrt();
+    let mut masked = scores.data().to_vec();
+    for i in 0..s {
+        for j in i + 1..s {
+            masked[i * s + j] = -1e9
+        }
+    }
+    let scaled = Tensor::from_vec(vec![s, s], masked.iter().map(|x| x / scale).collect())?;
+    let weights = softmax(&scaled)?;
+    weights.matmul(v)
+}
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+    #[test]
+    fn causal_attention_matches_manual_reference() {
+        let q = Tensor::from_vec(vec![2, 2], vec![1., 0., 0., 1.]).unwrap();
+        let k = q.clone();
+        let v = Tensor::from_vec(vec![2, 2], vec![2., 3., 5., 7.]).unwrap();
+        let o = causal_attention(&q, &k, &v).unwrap();
+        assert!((o.data()[0] - 2.).abs() < 1e-5);
+        assert!((o.data()[1] - 3.).abs() < 1e-5);
+        let w = 1f32 / (1f32 + (-1f32 / 2f32.sqrt()).exp());
+        assert!((o.data()[2] - (w * 5. + (1. - w) * 2.)).abs() < 1e-5);
+        assert!((o.data()[3] - (w * 7. + (1. - w) * 3.)).abs() < 1e-5)
+    }
+}
