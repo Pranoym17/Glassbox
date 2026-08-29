@@ -192,7 +192,9 @@ impl Tape {
                     self.acc(&mut g, e.inputs[0], up.matmul(&rt)?)?;
                     self.acc(&mut g, e.inputs[1], lt.matmul(&up)?)?
                 }
-                (OpType::Transpose, _) => self.acc(&mut g, e.inputs[0], up.permute(&[1, 0])?)?,
+                (OpType::Transpose, _) => {
+                    self.acc(&mut g, e.inputs[0], up.permute(&[1, 0])?.contiguous())?
+                }
                 (OpType::Scale, SavedContext::Scale { factor }) => {
                     let scalar = Tensor::from_vec(vec![], vec![*factor])?;
                     self.acc(&mut g, e.inputs[0], up.mul(&scalar)?)?

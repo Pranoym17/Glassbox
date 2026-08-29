@@ -1,3 +1,4 @@
+use crate::autograd::{Tape, TapeError, TensorId};
 use crate::{Tensor, TensorError};
 fn dims(x: &Tensor) -> Result<(usize, usize), TensorError> {
     if x.shape().len() != 2 {
@@ -190,26 +191,45 @@ mod layer_tests {
         }
     }
 }
-pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, TensorError> {
-    let (s, d) = dims(q)?;
-    if k.shape() != [s, d] || v.shape() != [s, d] {
+pub fn causal_attention_tape(
+    tape: &mut Tape,
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+) -> Result<TensorId, TapeError> {
+    let q_shape = tape.value(q)?.shape().to_vec();
+    let k_shape = tape.value(k)?.shape().to_vec();
+    let v_shape = tape.value(v)?.shape().to_vec();
+    if q_shape.len() != 2 || k_shape != q_shape || v_shape != q_shape {
         return Err(TensorError::IncompatibleShapes {
-            left: q.shape().to_vec(),
-            right: k.shape().to_vec(),
-        });
-    }
-    let kt = k.permute(&[1, 0])?;
-    let scores = q.matmul(&kt)?;
-    let scale = (d as f32).sqrt();
-    let mut masked = scores.data().to_vec();
-    for i in 0..s {
-        for j in i + 1..s {
-            masked[i * s + j] = -1e9
+            left: q_shape,
+            right: k_shape,
         }
+        .into());
     }
-    let scaled = Tensor::from_vec(vec![s, s], masked.iter().map(|x| x / scale).collect())?;
-    let weights = softmax(&scaled)?;
-    weights.matmul(v)
+    let dimension = tape.value(q)?.shape()[1];
+    let kt = tape.transpose(k)?;
+    let scores = tape.matmul(q, kt)?;
+    let scaled = tape.scale(scores, 1.0 / (dimension as f32).sqrt())?;
+    let masked = tape.causal_mask(scaled)?;
+    let weights = tape.softmax(masked)?;
+    tape.matmul(weights, v)
+}
+
+pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, TensorError> {
+    let mut tape = Tape::new();
+    let q = tape.leaf(q.clone());
+    let k = tape.leaf(k.clone());
+    let v = tape.leaf(v.clone());
+    let output = causal_attention_tape(&mut tape, q, k, v).map_err(tape_tensor_error)?;
+    Ok(tape.value(output).map_err(tape_tensor_error)?.clone())
+}
+
+fn tape_tensor_error(error: TapeError) -> TensorError {
+    match error {
+        TapeError::Tensor(error) => error,
+        TapeError::UnknownTensor(id) => panic!("attention produced unknown tensor {id}"),
+    }
 }
 #[cfg(test)]
 mod attention_tests {
@@ -225,5 +245,59 @@ mod attention_tests {
         let w = 1f32 / (1f32 + (-1f32 / 2f32.sqrt()).exp());
         assert!((o.data()[2] - (w * 5. + (1. - w) * 2.)).abs() < 1e-5);
         assert!((o.data()[3] - (w * 7. + (1. - w) * 3.)).abs() < 1e-5)
+    }
+
+    fn objective(q: &Tensor, k: &Tensor, v: &Tensor) -> f32 {
+        causal_attention(q, k, v).unwrap().data().iter().sum()
+    }
+
+    fn check_gradient(analytic: &Tensor, values: &Tensor, evaluate: impl Fn(Tensor) -> f32) {
+        let eps = 1e-3;
+        for index in 0..values.data().len() {
+            let mut plus = values.data().to_vec();
+            let mut minus = plus.clone();
+            plus[index] += eps;
+            minus[index] -= eps;
+            let plus = Tensor::from_vec(values.shape().to_vec(), plus).unwrap();
+            let minus = Tensor::from_vec(values.shape().to_vec(), minus).unwrap();
+            let numerical = (evaluate(plus) - evaluate(minus)) / (2.0 * eps);
+            assert!(
+                (analytic.data()[index] - numerical).abs() < 5e-3,
+                "gradient {index}: analytic={}, numerical={numerical}",
+                analytic.data()[index]
+            );
+        }
+    }
+
+    #[test]
+    fn causal_attention_backward_matches_finite_differences() {
+        let values = |offset: usize| {
+            Tensor::from_vec(
+                vec![4, 8],
+                (0..32)
+                    .map(|index| ((index * 7 + offset) % 19) as f32 * 0.04 - 0.35)
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let q_value = values(1);
+        let k_value = values(5);
+        let v_value = values(9);
+        let mut tape = Tape::new();
+        let q = tape.leaf(q_value.clone());
+        let k = tape.leaf(k_value.clone());
+        let v = tape.leaf(v_value.clone());
+        let output = causal_attention_tape(&mut tape, q, k, v).unwrap();
+        let gradients = tape.backward(output).unwrap();
+
+        check_gradient(&gradients[&q], &q_value, |value| {
+            objective(&value, &k_value, &v_value)
+        });
+        check_gradient(&gradients[&k], &k_value, |value| {
+            objective(&q_value, &value, &v_value)
+        });
+        check_gradient(&gradients[&v], &v_value, |value| {
+            objective(&q_value, &k_value, &value)
+        });
     }
 }
