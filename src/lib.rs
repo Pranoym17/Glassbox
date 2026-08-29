@@ -34,6 +34,10 @@ pub enum TensorError {
         left: Vec<usize>,
         right: Vec<usize>,
     },
+    IncompatibleMatMul {
+        left: Vec<usize>,
+        right: Vec<usize>,
+    },
 }
 
 impl fmt::Display for TensorError {
@@ -60,6 +64,12 @@ impl fmt::Display for TensorError {
             }
             Self::IncompatibleShapes { left, right } => {
                 write!(f, "cannot broadcast shapes {left:?} and {right:?}")
+            }
+            Self::IncompatibleMatMul { left, right } => {
+                write!(
+                    f,
+                    "cannot multiply matrices with shapes {left:?} and {right:?}"
+                )
             }
         }
     }
@@ -162,6 +172,28 @@ impl Tensor {
     }
     pub fn log(&self) -> Result<Self, TensorError> {
         self.unary_op(f32::ln)
+    }
+
+    pub fn matmul(&self, rhs: &Self) -> Result<Self, TensorError> {
+        if self.shape.len() != 2 || rhs.shape.len() != 2 || self.shape[1] != rhs.shape[0] {
+            return Err(TensorError::IncompatibleMatMul {
+                left: self.shape.clone(),
+                right: rhs.shape.clone(),
+            });
+        }
+        let left = self.contiguous();
+        let right = rhs.contiguous();
+        let (rows, inner, columns) = (left.shape[0], left.shape[1], right.shape[1]);
+        let mut output = vec![0.0; rows * columns];
+        for row in 0..rows {
+            for column in 0..columns {
+                for index in 0..inner {
+                    output[row * columns + column] +=
+                        left.data[row * inner + index] * right.data[index * columns + column];
+                }
+            }
+        }
+        Self::from_vec(vec![rows, columns], output)
     }
 
     pub fn sum_axis(&self, axis: usize) -> Result<Self, TensorError> {

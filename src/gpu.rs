@@ -85,6 +85,50 @@ impl CudaBackend {
         self.unary("log_kernel", input)
     }
 
+    pub fn matmul(&self, left: &Tensor, right: &Tensor) -> Result<Tensor, GpuError> {
+        if left.shape().len() != 2
+            || right.shape().len() != 2
+            || left.shape()[1] != right.shape()[0]
+        {
+            return Err(TensorError::IncompatibleMatMul {
+                left: left.shape().to_vec(),
+                right: right.shape().to_vec(),
+            }
+            .into());
+        }
+        let left = left.contiguous();
+        let right = right.contiguous();
+        let (rows, inner, columns) = (left.shape()[0], left.shape()[1], right.shape()[1]);
+        let device_left = self.stream.clone_htod(left.data())?;
+        let device_right = self.stream.clone_htod(right.data())?;
+        let mut device_output = self.stream.alloc_zeros::<f32>(rows * columns)?;
+        let function = self.module.load_function("matmul_naive")?;
+        let tile = 16_u32;
+        unsafe {
+            self.stream
+                .launch_builder(&function)
+                .arg(&device_left)
+                .arg(&device_right)
+                .arg(&mut device_output)
+                .arg(&(rows as u64))
+                .arg(&(inner as u64))
+                .arg(&(columns as u64))
+                .launch(LaunchConfig {
+                    grid_dim: (
+                        (columns as u32).div_ceil(tile),
+                        (rows as u32).div_ceil(tile),
+                        1,
+                    ),
+                    block_dim: (tile, tile, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(Tensor::from_vec(
+            vec![rows, columns],
+            self.stream.clone_dtoh(&device_output)?,
+        )?)
+    }
+
     pub fn sum_axis(&self, input: &Tensor, axis: usize) -> Result<Tensor, GpuError> {
         if axis >= input.shape().len() {
             return Err(TensorError::InvalidAxis {
@@ -279,5 +323,29 @@ mod tests {
             &backend.sum_axis(&input, 1).unwrap(),
             &input.sum_axis(1).unwrap(),
         );
+    }
+    #[test]
+    fn gpu_naive_matmul_matches_cpu_for_4x4_and_16x16() {
+        let backend = CudaBackend::new().unwrap();
+        for size in [4, 16] {
+            let left = Tensor::from_vec(
+                vec![size, size],
+                (0..size * size)
+                    .map(|index| (index % 7) as f32 - 3.0)
+                    .collect(),
+            )
+            .unwrap();
+            let right = Tensor::from_vec(
+                vec![size, size],
+                (0..size * size)
+                    .map(|index| (index % 5) as f32 * 0.25)
+                    .collect(),
+            )
+            .unwrap();
+            assert_close(
+                &backend.matmul(&left, &right).unwrap(),
+                &left.matmul(&right).unwrap(),
+            );
+        }
     }
 }

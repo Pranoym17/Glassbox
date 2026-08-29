@@ -67,3 +67,19 @@ extern "C" __global__ void sum_axis_finalize(
     }
     if (thread == 0) output[output_index] = shared[0];
 }
+
+// Naive matrix multiplication: one CUDA thread computes C[row, col].
+extern "C" __global__ void matmul_naive(
+    const float* left, const float* right, float* output,
+    unsigned long long rows, unsigned long long inner, unsigned long long columns
+) {
+    const unsigned long long column = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long row = static_cast<unsigned long long>(blockIdx.y) * blockDim.y + threadIdx.y;
+    if (row >= rows || column >= columns) return;
+
+    float sum = 0.0f;
+    for (unsigned long long index = 0; index < inner; ++index) {
+        sum += left[row * inner + index] * right[index * columns + column];
+    }
+    output[row * columns + column] = sum;
+}
