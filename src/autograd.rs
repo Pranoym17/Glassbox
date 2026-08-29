@@ -7,6 +7,7 @@ pub enum OpType {
     Leaf,
     Add,
     Mul,
+    MatMul,
 }
 #[derive(Clone, Debug)]
 pub enum SavedContext {
@@ -83,6 +84,16 @@ impl Tape {
             out,
         ))
     }
+    pub fn matmul(&mut self, l: TensorId, r: TensorId) -> Result<TensorId, TapeError> {
+        let (a, b) = (self.value(l)?.clone(), self.value(r)?.clone());
+        let o = a.matmul(&b)?;
+        Ok(self.append(
+            OpType::MatMul,
+            vec![l, r],
+            SavedContext::Binary { left: a, right: b },
+            o,
+        ))
+    }
     pub fn backward(&self, loss: TensorId) -> Result<HashMap<TensorId, Tensor>, TapeError> {
         let mut seen = HashSet::new();
         let mut order = vec![];
@@ -121,6 +132,12 @@ impl Tape {
                         up.mul(left)?
                             .sum_to_shape(self.value(e.inputs[1])?.shape())?,
                     )?
+                }
+                (OpType::MatMul, SavedContext::Binary { left, right }) => {
+                    let rt = right.permute(&[1, 0])?;
+                    let lt = left.permute(&[1, 0])?;
+                    self.acc(&mut g, e.inputs[0], up.matmul(&rt)?)?;
+                    self.acc(&mut g, e.inputs[1], lt.matmul(&up)?)?
                 }
                 _ => unreachable!(),
             }
@@ -198,5 +215,66 @@ mod tests {
         assert_eq!(g[&a].data(), &[3.]);
         assert_eq!(g[&b].data(), &[2.]);
         assert_eq!(g[&c].data(), &[1.]);
+    }
+
+    fn objective(a: &Tensor, b: &Tensor, c: &Tensor, w: &Tensor) -> f32 {
+        a.matmul(b)
+            .unwrap()
+            .add(c)
+            .unwrap()
+            .mul(w)
+            .unwrap()
+            .data()
+            .iter()
+            .sum()
+    }
+
+    fn check_gradient(analytic: &Tensor, values: &Tensor, evaluate: impl Fn(Tensor) -> f32) {
+        let eps = 1e-3;
+        for index in 0..values.data().len() {
+            let mut plus = values.data().to_vec();
+            let mut minus = plus.clone();
+            plus[index] += eps;
+            minus[index] -= eps;
+            let plus = Tensor::from_vec(values.shape().to_vec(), plus).unwrap();
+            let minus = Tensor::from_vec(values.shape().to_vec(), minus).unwrap();
+            let numerical = (evaluate(plus) - evaluate(minus)) / (2.0 * eps);
+            assert!(
+                (analytic.data()[index] - numerical).abs() < 5e-3,
+                "gradient {index}: analytic={}, numerical={numerical}",
+                analytic.data()[index]
+            );
+        }
+    }
+
+    #[test]
+    fn matmul_add_mul_backward_matches_finite_differences() {
+        let a_value = Tensor::from_vec(vec![2, 3], vec![0.2, -0.4, 0.7, 1.1, 0.3, -0.2]).unwrap();
+        let b_value = Tensor::from_vec(vec![3, 2], vec![0.5, -0.3, 0.8, 0.2, -0.6, 0.9]).unwrap();
+        let c_value = Tensor::from_vec(vec![2, 2], vec![0.1, -0.2, 0.4, 0.3]).unwrap();
+        let w_value = Tensor::from_vec(vec![2, 2], vec![0.7, -0.5, 1.2, 0.4]).unwrap();
+
+        let mut tape = Tape::new();
+        let a = tape.leaf(a_value.clone());
+        let b = tape.leaf(b_value.clone());
+        let c = tape.leaf(c_value.clone());
+        let w = tape.leaf(w_value.clone());
+        let product = tape.matmul(a, b).unwrap();
+        let shifted = tape.add(product, c).unwrap();
+        let loss = tape.mul(shifted, w).unwrap();
+        let gradients = tape.backward(loss).unwrap();
+
+        check_gradient(&gradients[&a], &a_value, |value| {
+            objective(&value, &b_value, &c_value, &w_value)
+        });
+        check_gradient(&gradients[&b], &b_value, |value| {
+            objective(&a_value, &value, &c_value, &w_value)
+        });
+        check_gradient(&gradients[&c], &c_value, |value| {
+            objective(&a_value, &b_value, &value, &w_value)
+        });
+        check_gradient(&gradients[&w], &w_value, |value| {
+            objective(&a_value, &b_value, &c_value, &value)
+        });
     }
 }
