@@ -1,4 +1,7 @@
-use crate::{Tensor, TensorError};
+use crate::{
+    Tensor, TensorError,
+    transformer::{softmax, softmax_backward},
+};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 pub type TensorId = usize;
@@ -8,11 +11,17 @@ pub enum OpType {
     Add,
     Mul,
     MatMul,
+    Transpose,
+    Scale,
+    CausalMask,
+    Softmax,
 }
 #[derive(Clone, Debug)]
 pub enum SavedContext {
     None,
     Binary { left: Tensor, right: Tensor },
+    Scale { factor: f32 },
+    Softmax { output: Tensor },
 }
 #[derive(Clone, Debug)]
 pub struct TapeEntry {
@@ -94,6 +103,50 @@ impl Tape {
             o,
         ))
     }
+    pub fn transpose(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
+        let output = self.value(input)?.permute(&[1, 0])?;
+        Ok(self.append(OpType::Transpose, vec![input], SavedContext::None, output))
+    }
+    pub fn scale(&mut self, input: TensorId, factor: f32) -> Result<TensorId, TapeError> {
+        let scalar = Tensor::from_vec(vec![], vec![factor])?;
+        let output = self.value(input)?.mul(&scalar)?;
+        Ok(self.append(
+            OpType::Scale,
+            vec![input],
+            SavedContext::Scale { factor },
+            output,
+        ))
+    }
+    pub fn causal_mask(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
+        let value = self.value(input)?;
+        if value.shape().len() != 2 || value.shape()[0] != value.shape()[1] {
+            return Err(TensorError::IncompatibleShapes {
+                left: value.shape().to_vec(),
+                right: vec![value.shape()[0], value.shape()[0]],
+            }
+            .into());
+        }
+        let size = value.shape()[0];
+        let mut data = value.contiguous().data().to_vec();
+        for row in 0..size {
+            for column in row + 1..size {
+                data[row * size + column] = -1e9;
+            }
+        }
+        let output = Tensor::from_vec(vec![size, size], data)?;
+        Ok(self.append(OpType::CausalMask, vec![input], SavedContext::None, output))
+    }
+    pub fn softmax(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
+        let output = softmax(self.value(input)?)?;
+        Ok(self.append(
+            OpType::Softmax,
+            vec![input],
+            SavedContext::Softmax {
+                output: output.clone(),
+            },
+            output,
+        ))
+    }
     pub fn backward(&self, loss: TensorId) -> Result<HashMap<TensorId, Tensor>, TapeError> {
         let mut seen = HashSet::new();
         let mut order = vec![];
@@ -138,6 +191,28 @@ impl Tape {
                     let lt = left.permute(&[1, 0])?;
                     self.acc(&mut g, e.inputs[0], up.matmul(&rt)?)?;
                     self.acc(&mut g, e.inputs[1], lt.matmul(&up)?)?
+                }
+                (OpType::Transpose, _) => self.acc(&mut g, e.inputs[0], up.permute(&[1, 0])?)?,
+                (OpType::Scale, SavedContext::Scale { factor }) => {
+                    let scalar = Tensor::from_vec(vec![], vec![*factor])?;
+                    self.acc(&mut g, e.inputs[0], up.mul(&scalar)?)?
+                }
+                (OpType::CausalMask, _) => {
+                    let size = up.shape()[0];
+                    let mut data = up.contiguous().data().to_vec();
+                    for row in 0..size {
+                        for column in row + 1..size {
+                            data[row * size + column] = 0.0;
+                        }
+                    }
+                    self.acc(
+                        &mut g,
+                        e.inputs[0],
+                        Tensor::from_vec(vec![size, size], data)?,
+                    )?
+                }
+                (OpType::Softmax, SavedContext::Softmax { output }) => {
+                    self.acc(&mut g, e.inputs[0], softmax_backward(output, &up)?)?
                 }
                 _ => unreachable!(),
             }
@@ -275,6 +350,51 @@ mod tests {
         });
         check_gradient(&gradients[&w], &w_value, |value| {
             objective(&a_value, &b_value, &c_value, &value)
+        });
+    }
+
+    fn masked_softmax_objective(input: &Tensor, weights: &Tensor) -> f32 {
+        let size = input.shape()[0];
+        let scalar = Tensor::from_vec(vec![], vec![0.7]).unwrap();
+        let scaled = input.mul(&scalar).unwrap();
+        let mut data = scaled.data().to_vec();
+        for row in 0..size {
+            for column in row + 1..size {
+                data[row * size + column] = -1e9;
+            }
+        }
+        softmax(&Tensor::from_vec(vec![size, size], data).unwrap())
+            .unwrap()
+            .mul(weights)
+            .unwrap()
+            .data()
+            .iter()
+            .sum()
+    }
+
+    #[test]
+    fn softmax_scale_mask_backward_matches_finite_differences() {
+        let input = Tensor::from_vec(
+            vec![3, 3],
+            vec![0.2, -0.4, 0.7, 1.1, 0.3, -0.2, -0.5, 0.8, 0.4],
+        )
+        .unwrap();
+        let weights = Tensor::from_vec(
+            vec![3, 3],
+            vec![0.3, -0.6, 0.2, 0.7, -0.1, 0.5, -0.4, 0.9, 0.1],
+        )
+        .unwrap();
+        let mut tape = Tape::new();
+        let input_id = tape.leaf(input.clone());
+        let weights_id = tape.leaf(weights.clone());
+        let scaled = tape.scale(input_id, 0.7).unwrap();
+        let masked = tape.causal_mask(scaled).unwrap();
+        let probabilities = tape.softmax(masked).unwrap();
+        let loss = tape.mul(probabilities, weights_id).unwrap();
+        let gradients = tape.backward(loss).unwrap();
+
+        check_gradient(&gradients[&input_id], &input, |value| {
+            masked_softmax_objective(&value, &weights)
         });
     }
 }
