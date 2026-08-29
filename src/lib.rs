@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub mod gpu;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tensor {
     shape: Vec<usize>,
@@ -24,6 +26,10 @@ pub enum TensorError {
         dimension: usize,
     },
     InvalidPermutation,
+    InvalidAxis {
+        axis: usize,
+        rank: usize,
+    },
     IncompatibleShapes {
         left: Vec<usize>,
         right: Vec<usize>,
@@ -44,13 +50,14 @@ impl fmt::Display for TensorError {
                 axis,
                 index,
                 dimension,
-            } => {
-                write!(
-                    f,
-                    "index {index} is out of bounds for axis {axis} with size {dimension}"
-                )
-            }
+            } => write!(
+                f,
+                "index {index} is out of bounds for axis {axis} with size {dimension}"
+            ),
             Self::InvalidPermutation => write!(f, "axes must be a permutation of tensor axes"),
+            Self::InvalidAxis { axis, rank } => {
+                write!(f, "axis {axis} is invalid for a tensor with rank {rank}")
+            }
             Self::IncompatibleShapes { left, right } => {
                 write!(f, "cannot broadcast shapes {left:?} and {right:?}")
             }
@@ -87,11 +94,9 @@ impl Tensor {
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
-
     pub fn strides(&self) -> &[usize] {
         &self.strides
     }
-
     pub fn data(&self) -> &[f32] {
         &self.data
     }
@@ -122,12 +127,95 @@ impl Tensor {
         })
     }
 
-    pub fn add(&self, rhs: &Self) -> Result<Self, TensorError> {
-        self.binary_op(rhs, |left, right| left + right)
+    pub fn contiguous(&self) -> Self {
+        if self.is_contiguous() {
+            return self.clone();
+        }
+        let output_strides = contiguous_strides(&self.shape);
+        let data = (0..numel(&self.shape))
+            .map(|flat_index| {
+                let coordinates = unravel(flat_index, &self.shape, &output_strides);
+                self.data[broadcast_offset(&coordinates, &self.shape, self)]
+            })
+            .collect();
+        Self {
+            shape: self.shape.clone(),
+            strides: output_strides,
+            data,
+        }
     }
 
+    pub fn add(&self, rhs: &Self) -> Result<Self, TensorError> {
+        self.binary_op(rhs, |a, b| a + b)
+    }
     pub fn mul(&self, rhs: &Self) -> Result<Self, TensorError> {
-        self.binary_op(rhs, |left, right| left * right)
+        self.binary_op(rhs, |a, b| a * b)
+    }
+    pub fn sub(&self, rhs: &Self) -> Result<Self, TensorError> {
+        self.binary_op(rhs, |a, b| a - b)
+    }
+    pub fn div(&self, rhs: &Self) -> Result<Self, TensorError> {
+        self.binary_op(rhs, |a, b| a / b)
+    }
+    pub fn exp(&self) -> Result<Self, TensorError> {
+        self.unary_op(f32::exp)
+    }
+    pub fn log(&self) -> Result<Self, TensorError> {
+        self.unary_op(f32::ln)
+    }
+
+    pub fn sum_axis(&self, axis: usize) -> Result<Self, TensorError> {
+        if axis >= self.shape.len() {
+            return Err(TensorError::InvalidAxis {
+                axis,
+                rank: self.shape.len(),
+            });
+        }
+        let input = self.contiguous();
+        let outer = numel(&input.shape[..axis]);
+        let reduce = input.shape[axis];
+        let inner = numel(&input.shape[axis + 1..]);
+        let mut output = vec![0.0; outer * inner];
+        for outer_index in 0..outer {
+            for inner_index in 0..inner {
+                let base = outer_index * reduce * inner + inner_index;
+                output[outer_index * inner + inner_index] = (0..reduce)
+                    .map(|reduce_index| input.data[base + reduce_index * inner])
+                    .sum();
+            }
+        }
+        let mut output_shape = input.shape;
+        output_shape.remove(axis);
+        Self::from_vec(output_shape, output)
+    }
+
+    pub(crate) fn broadcast_shape(
+        left: &[usize],
+        right: &[usize],
+    ) -> Result<Vec<usize>, TensorError> {
+        broadcast_shape(left, right)
+    }
+
+    pub(crate) fn broadcast_to(&self, shape: &[usize]) -> Result<Self, TensorError> {
+        if broadcast_shape(&self.shape, shape)? != shape {
+            return Err(TensorError::IncompatibleShapes {
+                left: self.shape.clone(),
+                right: shape.to_vec(),
+            });
+        }
+        let output_strides = contiguous_strides(shape);
+        let data = (0..numel(shape))
+            .map(|flat_index| {
+                let coordinates = unravel(flat_index, shape, &output_strides);
+                self.data[broadcast_offset(&coordinates, shape, self)]
+            })
+            .collect();
+        Self::from_vec(shape.to_vec(), data)
+    }
+
+    fn unary_op(&self, operation: impl Fn(f32) -> f32) -> Result<Self, TensorError> {
+        let input = self.contiguous();
+        Self::from_vec(input.shape, input.data.into_iter().map(operation).collect())
     }
 
     fn binary_op(
@@ -136,16 +224,16 @@ impl Tensor {
         operation: impl Fn(f32, f32) -> f32,
     ) -> Result<Self, TensorError> {
         let output_shape = broadcast_shape(&self.shape, &rhs.shape)?;
-        let output_strides = contiguous_strides(&output_shape);
-        let mut output = Vec::with_capacity(numel(&output_shape));
-
-        for flat_index in 0..numel(&output_shape) {
-            let coordinates = unravel(flat_index, &output_shape, &output_strides);
-            let left_offset = broadcast_offset(&coordinates, &output_shape, self);
-            let right_offset = broadcast_offset(&coordinates, &output_shape, rhs);
-            output.push(operation(self.data[left_offset], rhs.data[right_offset]));
-        }
-        Self::from_vec(output_shape, output)
+        let left = self.broadcast_to(&output_shape)?;
+        let right = rhs.broadcast_to(&output_shape)?;
+        Self::from_vec(
+            output_shape,
+            left.data
+                .into_iter()
+                .zip(right.data)
+                .map(|(a, b)| operation(a, b))
+                .collect(),
+        )
     }
 
     fn offset(&self, indices: &[usize]) -> Result<usize, TensorError> {
@@ -249,25 +337,43 @@ mod tests {
     }
 
     #[test]
-    fn add_broadcasts_a_vector_over_2d_rows() {
+    fn elementwise_ops_broadcast_and_match_expected_values() {
         let matrix = Tensor::from_vec(vec![2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap();
         let vector = Tensor::from_vec(vec![3], vec![10., 20., 30.]).unwrap();
-
-        let result = matrix.add(&vector).unwrap();
-
-        assert_eq!(result.shape(), &[2, 3]);
-        assert_eq!(result.data(), &[11., 22., 33., 14., 25., 36.]);
+        assert_eq!(
+            matrix.add(&vector).unwrap().data(),
+            &[11., 22., 33., 14., 25., 36.]
+        );
+        assert_eq!(
+            matrix.sub(&vector).unwrap().data(),
+            &[-9., -18., -27., -6., -15., -24.]
+        );
+        assert_eq!(
+            matrix.mul(&vector).unwrap().data(),
+            &[10., 40., 90., 40., 100., 180.]
+        );
+        assert_eq!(
+            matrix.div(&vector).unwrap().data(),
+            &[0.1, 0.1, 0.1, 0.4, 0.25, 0.2]
+        );
     }
 
     #[test]
-    fn mul_broadcasts_two_2d_tensors() {
-        let column = Tensor::from_vec(vec![2, 1], vec![2., 3.]).unwrap();
-        let row = Tensor::from_vec(vec![1, 3], vec![10., 20., 30.]).unwrap();
-
-        let result = column.mul(&row).unwrap();
-
-        assert_eq!(result.shape(), &[2, 3]);
-        assert_eq!(result.data(), &[20., 40., 60., 30., 60., 90.]);
+    fn unary_ops_and_reduction_are_correct() {
+        let values = Tensor::from_vec(vec![2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap();
+        assert_eq!(values.sum_axis(0).unwrap().data(), &[5., 7., 9.]);
+        assert_eq!(values.sum_axis(1).unwrap().data(), &[6., 15.]);
+        for (&actual, &expected) in values
+            .exp()
+            .unwrap()
+            .log()
+            .unwrap()
+            .data()
+            .iter()
+            .zip(values.data())
+        {
+            assert!((actual - expected).abs() < 1e-5);
+        }
     }
 
     #[test]
@@ -275,7 +381,6 @@ mod tests {
         let matrix = Tensor::from_vec(vec![2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap();
         let transposed = matrix.permute(&[1, 0]).unwrap();
         let scalar = Tensor::from_vec(vec![], vec![10.]).unwrap();
-
         assert_eq!(transposed.shape(), &[3, 2]);
         assert_eq!(transposed.strides(), &[1, 3]);
         assert!(!transposed.is_contiguous());
@@ -287,16 +392,19 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_shapes_fail_clearly() {
+    fn invalid_tensor_operations_fail_clearly() {
         let left = Tensor::zeros(vec![2, 3]).unwrap();
         let right = Tensor::zeros(vec![2, 2]).unwrap();
-
         assert_eq!(
             left.add(&right).unwrap_err(),
             TensorError::IncompatibleShapes {
                 left: vec![2, 3],
-                right: vec![2, 2],
+                right: vec![2, 2]
             }
+        );
+        assert_eq!(
+            left.sum_axis(2).unwrap_err(),
+            TensorError::InvalidAxis { axis: 2, rank: 2 }
         );
     }
 }

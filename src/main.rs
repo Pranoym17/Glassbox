@@ -19,11 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut d_result = stream.alloc_zeros::<f32>(n)?;
     let threads_per_block = 256_u32;
     let config = LaunchConfig {
-        grid_dim: (
-            ((n as u32) + threads_per_block - 1) / threads_per_block,
-            1,
-            1,
-        ),
+        grid_dim: ((n as u32).div_ceil(threads_per_block), 1, 1),
         block_dim: (threads_per_block, 1, 1),
         shared_mem_bytes: 0,
     };
