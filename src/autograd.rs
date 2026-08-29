@@ -399,4 +399,75 @@ mod tests {
             masked_softmax_objective(&value, &weights)
         });
     }
+
+    #[test]
+    fn individual_transformer_tape_ops_match_finite_differences() {
+        let input = Tensor::from_vec(vec![2, 2], vec![0.2, -0.4, 0.7, 0.1]).unwrap();
+        let weights = Tensor::from_vec(vec![2, 2], vec![0.3, -0.6, 0.2, 0.8]).unwrap();
+
+        let mut scale_tape = Tape::new();
+        let scale_input = scale_tape.leaf(input.clone());
+        let scale_weights = scale_tape.leaf(weights.clone());
+        let scaled = scale_tape.scale(scale_input, 0.7).unwrap();
+        let scale_loss = scale_tape.mul(scaled, scale_weights).unwrap();
+        let scale_gradients = scale_tape.backward(scale_loss).unwrap();
+        check_gradient(&scale_gradients[&scale_input], &input, |value| {
+            value
+                .mul(&Tensor::from_vec(vec![], vec![0.7]).unwrap())
+                .unwrap()
+                .mul(&weights)
+                .unwrap()
+                .data()
+                .iter()
+                .sum()
+        });
+
+        let mut softmax_tape = Tape::new();
+        let softmax_input = softmax_tape.leaf(input.clone());
+        let softmax_weights = softmax_tape.leaf(weights.clone());
+        let probabilities = softmax_tape.softmax(softmax_input).unwrap();
+        let softmax_loss = softmax_tape.mul(probabilities, softmax_weights).unwrap();
+        let softmax_gradients = softmax_tape.backward(softmax_loss).unwrap();
+        check_gradient(&softmax_gradients[&softmax_input], &input, |value| {
+            softmax(&value)
+                .unwrap()
+                .mul(&weights)
+                .unwrap()
+                .data()
+                .iter()
+                .sum()
+        });
+
+        let mask_input = Tensor::from_vec(
+            vec![3, 3],
+            vec![0.2, -0.4, 0.7, 1.1, 0.3, -0.2, -0.5, 0.8, 0.4],
+        )
+        .unwrap();
+        let mask_weights = Tensor::from_vec(
+            vec![3, 3],
+            vec![0.3, 0.0, 0.0, 0.7, -0.1, 0.0, -0.4, 0.9, 0.1],
+        )
+        .unwrap();
+        let mut mask_tape = Tape::new();
+        let mask_input_id = mask_tape.leaf(mask_input.clone());
+        let mask_weights_id = mask_tape.leaf(mask_weights.clone());
+        let masked = mask_tape.causal_mask(mask_input_id).unwrap();
+        let mask_loss = mask_tape.mul(masked, mask_weights_id).unwrap();
+        let mask_gradients = mask_tape.backward(mask_loss).unwrap();
+        check_gradient(&mask_gradients[&mask_input_id], &mask_input, |value| {
+            let mut data = value.data().to_vec();
+            for row in 0..3 {
+                for column in row + 1..3 {
+                    data[row * 3 + column] = -1e9;
+                }
+            }
+            Tensor::from_vec(vec![3, 3], data)
+                .unwrap()
+                .mul(&mask_weights)
+                .unwrap()
+                .data()
+                .iter()
+                .sum()
+        });
+    }
 }
