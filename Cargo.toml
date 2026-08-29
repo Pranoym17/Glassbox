@@ -4,5 +4,12 @@ version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
 cudarc = { version = "0.19.9", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-version-from-build-system", "fallback-latest"] }
+pyo3 = "0.29.2"

@@ -313,6 +313,12 @@ impl Gpt {
         parameters.extend(self.output.parameters());
         parameters
     }
+    pub fn parameter_values(&self) -> Result<Vec<Tensor>, GptError> {
+        self.parameters()
+            .into_iter()
+            .map(|id| self.tape.value(id).cloned().map_err(GptError::from))
+            .collect()
+    }
 
     pub fn forward(&mut self, tokens: &[Vec<usize>]) -> Result<Tensor, GptError> {
         let Some(first) = tokens.first() else {
