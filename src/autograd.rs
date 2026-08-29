@@ -1,6 +1,6 @@
 use crate::{
     Tensor, TensorError,
-    transformer::{softmax, softmax_backward},
+    transformer::{LayerNormContext, layer_norm, layer_norm_backward, softmax, softmax_backward},
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -15,13 +15,39 @@ pub enum OpType {
     Scale,
     CausalMask,
     Softmax,
+    Embedding,
+    LayerNorm,
+    Gelu,
+    Reshape,
 }
 #[derive(Clone, Debug)]
 pub enum SavedContext {
     None,
-    Binary { left: Tensor, right: Tensor },
-    Scale { factor: f32 },
-    Softmax { output: Tensor },
+    Binary {
+        left: Tensor,
+        right: Tensor,
+    },
+    Scale {
+        factor: f32,
+    },
+    Softmax {
+        output: Tensor,
+    },
+    Embedding {
+        indices: Vec<usize>,
+        table_shape: Vec<usize>,
+    },
+    LayerNorm {
+        context: LayerNormContext,
+        gamma: Tensor,
+        epsilon: f32,
+    },
+    Gelu {
+        input: Tensor,
+    },
+    Reshape {
+        input_shape: Vec<usize>,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct TapeEntry {
@@ -147,6 +173,87 @@ impl Tape {
             output,
         ))
     }
+    pub fn embedding(
+        &mut self,
+        table: TensorId,
+        indices: Vec<usize>,
+    ) -> Result<TensorId, TapeError> {
+        let value = self.value(table)?.contiguous();
+        if value.shape().len() != 2 {
+            return Err(TensorError::RankMismatch {
+                expected: 2,
+                actual: value.shape().len(),
+            }
+            .into());
+        }
+        let (rows, columns) = (value.shape()[0], value.shape()[1]);
+        let mut data = Vec::with_capacity(indices.len() * columns);
+        for &index in &indices {
+            if index >= rows {
+                return Err(TensorError::IndexOutOfBounds {
+                    axis: 0,
+                    index,
+                    dimension: rows,
+                }
+                .into());
+            }
+            data.extend_from_slice(&value.data()[index * columns..(index + 1) * columns]);
+        }
+        let output = Tensor::from_vec(vec![indices.len(), columns], data)?;
+        Ok(self.append(
+            OpType::Embedding,
+            vec![table],
+            SavedContext::Embedding {
+                indices,
+                table_shape: value.shape().to_vec(),
+            },
+            output,
+        ))
+    }
+    pub fn layer_norm(
+        &mut self,
+        input: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        epsilon: f32,
+    ) -> Result<TensorId, TapeError> {
+        let gamma_value = self.value(gamma)?.clone();
+        let (output, context) =
+            layer_norm(self.value(input)?, &gamma_value, self.value(beta)?, epsilon)?;
+        Ok(self.append(
+            OpType::LayerNorm,
+            vec![input, gamma, beta],
+            SavedContext::LayerNorm {
+                context,
+                gamma: gamma_value,
+                epsilon,
+            },
+            output,
+        ))
+    }
+    pub fn gelu(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
+        let value = self.value(input)?.contiguous();
+        let output = Tensor::from_vec(
+            value.shape().to_vec(),
+            value.data().iter().copied().map(gelu_value).collect(),
+        )?;
+        Ok(self.append(
+            OpType::Gelu,
+            vec![input],
+            SavedContext::Gelu { input: value },
+            output,
+        ))
+    }
+    pub fn reshape(&mut self, input: TensorId, shape: Vec<usize>) -> Result<TensorId, TapeError> {
+        let input_shape = self.value(input)?.shape().to_vec();
+        let output = self.value(input)?.reshape(shape)?;
+        Ok(self.append(
+            OpType::Reshape,
+            vec![input],
+            SavedContext::Reshape { input_shape },
+            output,
+        ))
+    }
     pub fn backward(&self, loss: TensorId) -> Result<HashMap<TensorId, Tensor>, TapeError> {
         let mut seen = HashSet::new();
         let mut order = vec![];
@@ -216,6 +323,51 @@ impl Tape {
                 (OpType::Softmax, SavedContext::Softmax { output }) => {
                     self.acc(&mut g, e.inputs[0], softmax_backward(output, &up)?)?
                 }
+                (
+                    OpType::Embedding,
+                    SavedContext::Embedding {
+                        indices,
+                        table_shape,
+                    },
+                ) => {
+                    let columns = table_shape[1];
+                    let mut data = vec![0.0; table_shape[0] * columns];
+                    let upstream = up.contiguous();
+                    for (row, &index) in indices.iter().enumerate() {
+                        for column in 0..columns {
+                            data[index * columns + column] +=
+                                upstream.data()[row * columns + column];
+                        }
+                    }
+                    self.acc(
+                        &mut g,
+                        e.inputs[0],
+                        Tensor::from_vec(table_shape.clone(), data)?,
+                    )?
+                }
+                (
+                    OpType::LayerNorm,
+                    SavedContext::LayerNorm {
+                        context,
+                        gamma,
+                        epsilon,
+                    },
+                ) => {
+                    let (dx, dgamma, dbeta) = layer_norm_backward(&up, context, gamma, *epsilon)?;
+                    self.acc(&mut g, e.inputs[0], dx)?;
+                    self.acc(&mut g, e.inputs[1], dgamma)?;
+                    self.acc(&mut g, e.inputs[2], dbeta)?
+                }
+                (OpType::Gelu, SavedContext::Gelu { input }) => {
+                    let derivative = Tensor::from_vec(
+                        input.shape().to_vec(),
+                        input.data().iter().copied().map(gelu_derivative).collect(),
+                    )?;
+                    self.acc(&mut g, e.inputs[0], up.mul(&derivative)?)?
+                }
+                (OpType::Reshape, SavedContext::Reshape { input_shape }) => {
+                    self.acc(&mut g, e.inputs[0], up.reshape(input_shape.clone())?)?
+                }
                 _ => unreachable!(),
             }
         }
@@ -274,6 +426,16 @@ impl Default for Tape {
     fn default() -> Self {
         Self::new()
     }
+}
+fn gelu_value(x: f32) -> f32 {
+    let u = (2.0 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x.powi(3));
+    0.5 * x * (1.0 + u.tanh())
+}
+fn gelu_derivative(x: f32) -> f32 {
+    let c = (2.0 / std::f32::consts::PI).sqrt();
+    let u = c * (x + 0.044715 * x.powi(3));
+    let tanh = u.tanh();
+    0.5 * (1.0 + tanh) + 0.5 * x * (1.0 - tanh * tanh) * c * (1.0 + 3.0 * 0.044715 * x * x)
 }
 #[cfg(test)]
 mod tests {
@@ -468,6 +630,119 @@ mod tests {
                 .data()
                 .iter()
                 .sum()
+        });
+    }
+
+    fn embedding_objective(table: &Tensor, indices: &[usize], weights: &Tensor) -> f32 {
+        let columns = table.shape()[1];
+        indices
+            .iter()
+            .enumerate()
+            .map(|(row, &index)| {
+                (0..columns)
+                    .map(|column| {
+                        table.data()[index * columns + column]
+                            * weights.data()[row * columns + column]
+                    })
+                    .sum::<f32>()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn embedding_backward_scatter_add_matches_finite_differences() {
+        let table = Tensor::from_vec(
+            vec![4, 3],
+            vec![
+                0.1, 0.2, 0.3, -0.4, 0.5, 0.6, 0.7, -0.8, 0.9, 1.0, 1.1, -1.2,
+            ],
+        )
+        .unwrap();
+        let indices = vec![1, 2, 1];
+        let weights = Tensor::from_vec(
+            vec![3, 3],
+            vec![0.2, -0.3, 0.4, 0.7, 0.1, -0.5, -0.6, 0.8, 0.9],
+        )
+        .unwrap();
+        let mut tape = Tape::new();
+        let table_id = tape.leaf(table.clone());
+        let weights_id = tape.leaf(weights.clone());
+        let selected = tape.embedding(table_id, indices.clone()).unwrap();
+        let loss = tape.mul(selected, weights_id).unwrap();
+        let gradients = tape.backward(loss).unwrap();
+        assert_eq!(
+            &gradients[&table_id].data()[3..6],
+            &[
+                weights.data()[0] + weights.data()[6],
+                weights.data()[1] + weights.data()[7],
+                weights.data()[2] + weights.data()[8]
+            ]
+        );
+        check_gradient(&gradients[&table_id], &table, |value| {
+            embedding_objective(&value, &indices, &weights)
+        });
+    }
+
+    fn layer_norm_objective(x: &Tensor, gamma: &Tensor, beta: &Tensor, weights: &Tensor) -> f32 {
+        layer_norm(x, gamma, beta, 1e-5)
+            .unwrap()
+            .0
+            .mul(weights)
+            .unwrap()
+            .data()
+            .iter()
+            .sum()
+    }
+
+    #[test]
+    fn layer_norm_tape_backward_matches_finite_differences() {
+        let x = Tensor::from_vec(vec![2, 3], vec![0.2, -0.3, 0.7, 1.1, -0.4, 0.9]).unwrap();
+        let gamma = Tensor::from_vec(vec![3], vec![1.0, 0.7, 1.2]).unwrap();
+        let beta = Tensor::from_vec(vec![3], vec![0.1, 0.2, -0.1]).unwrap();
+        let weights = Tensor::from_vec(vec![2, 3], vec![0.3, -0.2, 0.5, -0.1, 0.6, 0.2]).unwrap();
+        let mut tape = Tape::new();
+        let x_id = tape.leaf(x.clone());
+        let gamma_id = tape.leaf(gamma.clone());
+        let beta_id = tape.leaf(beta.clone());
+        let weights_id = tape.leaf(weights.clone());
+        let normalized = tape.layer_norm(x_id, gamma_id, beta_id, 1e-5).unwrap();
+        let loss = tape.mul(normalized, weights_id).unwrap();
+        let gradients = tape.backward(loss).unwrap();
+        check_gradient(&gradients[&x_id], &x, |value| {
+            layer_norm_objective(&value, &gamma, &beta, &weights)
+        });
+        check_gradient(&gradients[&gamma_id], &gamma, |value| {
+            layer_norm_objective(&x, &value, &beta, &weights)
+        });
+        check_gradient(&gradients[&beta_id], &beta, |value| {
+            layer_norm_objective(&x, &gamma, &value, &weights)
+        });
+    }
+
+    #[test]
+    fn gelu_and_reshape_backward_match_finite_differences() {
+        let input = Tensor::from_vec(vec![2, 3], vec![-1.2, -0.4, 0.0, 0.3, 0.8, 1.5]).unwrap();
+        let weights = Tensor::from_vec(vec![3, 2], vec![0.2, -0.5, 0.7, 0.1, -0.3, 0.9]).unwrap();
+        let mut tape = Tape::new();
+        let input_id = tape.leaf(input.clone());
+        let weights_id = tape.leaf(weights.clone());
+        let activated = tape.gelu(input_id).unwrap();
+        let reshaped = tape.reshape(activated, vec![3, 2]).unwrap();
+        let loss = tape.mul(reshaped, weights_id).unwrap();
+        let gradients = tape.backward(loss).unwrap();
+        check_gradient(&gradients[&input_id], &input, |value| {
+            Tensor::from_vec(
+                value.shape().to_vec(),
+                value.data().iter().copied().map(gelu_value).collect(),
+            )
+            .unwrap()
+            .reshape(vec![3, 2])
+            .unwrap()
+            .mul(&weights)
+            .unwrap()
+            .data()
+            .iter()
+            .sum()
         });
     }
 }

@@ -160,6 +160,9 @@ impl Tensor {
             data,
         }
     }
+    pub fn reshape(&self, shape: Vec<usize>) -> Result<Self, TensorError> {
+        Self::from_vec(shape, self.contiguous().data)
+    }
 
     pub fn add(&self, rhs: &Self) -> Result<Self, TensorError> {
         self.binary_op(rhs, |a, b| a + b)
