@@ -1,5 +1,6 @@
 use std::fmt;
 
+pub mod autograd;
 pub mod gpu;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,6 +100,10 @@ impl Tensor {
     pub fn zeros(shape: Vec<usize>) -> Result<Self, TensorError> {
         let count = numel(&shape);
         Self::from_vec(shape, vec![0.0; count])
+    }
+    pub fn ones(shape: Vec<usize>) -> Result<Self, TensorError> {
+        let count = numel(&shape);
+        Self::from_vec(shape, vec![1.0; count])
     }
 
     pub fn shape(&self) -> &[usize] {
@@ -219,6 +224,37 @@ impl Tensor {
         let mut output_shape = input.shape;
         output_shape.remove(axis);
         Self::from_vec(output_shape, output)
+    }
+
+    pub(crate) fn sum_to_shape(&self, target: &[usize]) -> Result<Self, TensorError> {
+        if target.len() > self.shape.len() {
+            return Err(TensorError::IncompatibleShapes {
+                left: self.shape.clone(),
+                right: target.to_vec(),
+            });
+        };
+        let d = self.shape.len() - target.len();
+        for (i, &v) in target.iter().enumerate() {
+            if v != 1 && v != self.shape[i + d] {
+                return Err(TensorError::IncompatibleShapes {
+                    left: self.shape.clone(),
+                    right: target.to_vec(),
+                });
+            }
+        }
+        let src = self.contiguous();
+        let ss = contiguous_strides(src.shape());
+        let ts = contiguous_strides(target);
+        let mut out = vec![0.; numel(target)];
+        for f in 0..src.data.len() {
+            let c = unravel(f, src.shape(), &ss);
+            let mut o = 0;
+            for (i, (&v, &st)) in target.iter().zip(&ts).enumerate() {
+                o += if v == 1 { 0 } else { c[i + d] } * st
+            }
+            out[o] += src.data[f]
+        }
+        Self::from_vec(target.to_vec(), out)
     }
 
     pub(crate) fn broadcast_shape(
