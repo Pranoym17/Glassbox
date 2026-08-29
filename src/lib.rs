@@ -2,6 +2,7 @@ use std::fmt;
 
 pub mod autograd;
 pub mod gpu;
+pub mod nn;
 pub mod transformer;
 
 #[derive(Clone, Debug, PartialEq)]
