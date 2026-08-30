@@ -7,6 +7,7 @@ pub mod nn;
 pub mod optim;
 mod python;
 pub mod transformer;
+pub mod visualizer;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tensor {

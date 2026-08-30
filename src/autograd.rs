@@ -1,3 +1,4 @@
+use crate::visualizer::{Event, EventEmitter, Phase};
 use crate::{
     Tensor, TensorError,
     transformer::{LayerNormContext, layer_norm, layer_norm_backward, softmax, softmax_backward},
@@ -20,6 +21,25 @@ pub enum OpType {
     Gelu,
     Reshape,
     CrossEntropy,
+}
+impl OpType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Leaf => "leaf",
+            Self::Add => "add",
+            Self::Mul => "mul",
+            Self::MatMul => "matmul",
+            Self::Transpose => "transpose",
+            Self::Scale => "scale",
+            Self::CausalMask => "causal_mask",
+            Self::Softmax => "softmax",
+            Self::Embedding => "embedding",
+            Self::LayerNorm => "layer_norm",
+            Self::Gelu => "gelu",
+            Self::Reshape => "reshape",
+            Self::CrossEntropy => "cross_entropy",
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub enum SavedContext {
@@ -94,6 +114,9 @@ pub struct Tape {
     index: HashMap<TensorId, usize>,
     values: HashMap<TensorId, Tensor>,
     next_id: TensorId,
+    emitter: Option<EventEmitter>,
+    trace_enabled: bool,
+    trace_step: u64,
 }
 impl Tape {
     pub fn new() -> Self {
@@ -102,6 +125,9 @@ impl Tape {
             index: HashMap::new(),
             values: HashMap::new(),
             next_id: 0,
+            emitter: None,
+            trace_enabled: false,
+            trace_step: 0,
         }
     }
     pub fn leaf(&mut self, v: Tensor) -> TensorId {
@@ -115,6 +141,13 @@ impl Tape {
     }
     pub fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+    pub fn set_event_emitter(&mut self, emitter: Option<EventEmitter>) {
+        self.emitter = emitter;
+    }
+    pub fn set_trace(&mut self, step: u64, enabled: bool) {
+        self.trace_step = step;
+        self.trace_enabled = enabled;
     }
     pub fn overwrite_leaf(&mut self, id: TensorId, value: Tensor) -> Result<(), TapeError> {
         if self.entry(id)?.op != OpType::Leaf {
@@ -505,6 +538,7 @@ impl Tape {
                 }
                 _ => unreachable!(),
             }
+            self.emit_event(Phase::Backward, id, Some(l2_norm(&up)));
         }
         Ok(g)
     }
@@ -525,7 +559,27 @@ impl Tape {
             saved,
         });
         self.values.insert(id, value);
+        self.emit_event(Phase::Forward, id, None);
         id
+    }
+    fn emit_event(&self, phase: Phase, id: TensorId, grad_norm: Option<f32>) {
+        if !self.trace_enabled {
+            return;
+        }
+        let Some(emitter) = &self.emitter else {
+            return;
+        };
+        let entry = &self.entries[self.index[&id]];
+        let value = &self.values[&id];
+        emitter.emit(Event {
+            step: self.trace_step,
+            phase,
+            op: entry.op.as_str().to_string(),
+            output_id: id,
+            input_ids: entry.inputs.clone(),
+            shape: value.shape().to_vec(),
+            grad_norm,
+        });
     }
     fn visit(
         &self,
@@ -561,6 +615,14 @@ impl Default for Tape {
     fn default() -> Self {
         Self::new()
     }
+}
+fn l2_norm(tensor: &Tensor) -> f32 {
+    tensor
+        .data()
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt()
 }
 fn gelu_value(x: f32) -> f32 {
     let u = (2.0 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x.powi(3));
@@ -927,5 +989,47 @@ mod tests {
         assert_eq!(tape.value(left).unwrap().data(), &[3.0]);
         assert_eq!(tape.value(right).unwrap().data(), &[2.0]);
         assert!(matches!(tape.value(sum), Err(TapeError::UnknownTensor(id)) if id == sum));
+    }
+    fn traced_add(
+        emitter: Option<EventEmitter>,
+        enabled: bool,
+    ) -> (Tensor, HashMap<TensorId, Tensor>) {
+        let mut tape = Tape::new();
+        tape.set_event_emitter(emitter);
+        tape.set_trace(11, enabled);
+        let left = tape.leaf(Tensor::from_vec(vec![2], vec![1.0, 2.0]).unwrap());
+        let right = tape.leaf(Tensor::from_vec(vec![2], vec![3.0, 4.0]).unwrap());
+        let sum = tape.add(left, right).unwrap();
+        (
+            tape.value(sum).unwrap().clone(),
+            tape.backward(sum).unwrap(),
+        )
+    }
+
+    #[test]
+    fn disabled_tracing_is_byte_identical_and_emits_nothing() {
+        let plain = traced_add(None, false);
+        let (emitter, receiver) = crate::visualizer::event_channel(16);
+        let disabled = traced_add(Some(emitter), false);
+        assert_eq!(disabled.0, plain.0);
+        assert_eq!(disabled.1, plain.1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn tape_emits_forward_then_reverse_backward_with_norms() {
+        let (emitter, receiver) = crate::visualizer::event_channel(16);
+        traced_add(Some(emitter), true);
+        let events: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(events.len(), 6);
+        assert!(events[0].contains("\"phase\":\"forward\",\"op\":\"leaf\",\"output_id\":0"));
+        assert!(events[1].contains("\"phase\":\"forward\",\"op\":\"leaf\",\"output_id\":1"));
+        assert!(events[2].contains("\"phase\":\"forward\",\"op\":\"add\",\"output_id\":2"));
+        assert!(events[3].contains("\"phase\":\"backward\",\"op\":\"add\",\"output_id\":2"));
+        assert!(events[4].contains("\"phase\":\"backward\",\"op\":\"leaf\",\"output_id\":1"));
+        assert!(events[5].contains("\"phase\":\"backward\",\"op\":\"leaf\",\"output_id\":0"));
+        assert!(events[..3].iter().all(|event| !event.contains("grad_norm")));
+        assert!(events[3..].iter().all(|event| event.contains("grad_norm")));
+        assert!(events.iter().all(|event| event.contains("\"step\":11")));
     }
 }
