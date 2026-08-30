@@ -65,12 +65,21 @@ pub struct TapeEntry {
 pub enum TapeError {
     UnknownTensor(TensorId),
     Tensor(TensorError),
+    NonLeafUpdate(TensorId),
+    InvalidResetPoint(usize),
 }
 impl fmt::Display for TapeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownTensor(id) => write!(f, "unknown tensor {id}"),
             Self::Tensor(e) => write!(f, "tensor error: {e}"),
+            Self::NonLeafUpdate(id) => write!(f, "tensor {id} is not a leaf"),
+            Self::InvalidResetPoint(checkpoint) => {
+                write!(
+                    f,
+                    "tape checkpoint {checkpoint} does not contain only existing leaves"
+                )
+            }
         }
     }
 }
@@ -103,6 +112,52 @@ impl Tape {
     }
     pub fn entry(&self, id: TensorId) -> Result<&TapeEntry, TapeError> {
         Ok(&self.entries[*self.index.get(&id).ok_or(TapeError::UnknownTensor(id))?])
+    }
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn overwrite_leaf(&mut self, id: TensorId, value: Tensor) -> Result<(), TapeError> {
+        if self.entry(id)?.op != OpType::Leaf {
+            return Err(TapeError::NonLeafUpdate(id));
+        }
+        let current_shape = self.value(id)?.shape().to_vec();
+        if current_shape != value.shape() {
+            return Err(TensorError::IncompatibleShapes {
+                left: current_shape,
+                right: value.shape().to_vec(),
+            }
+            .into());
+        }
+        self.values.insert(id, value);
+        Ok(())
+    }
+    pub fn reset(&mut self, checkpoint: usize) -> Result<(), TapeError> {
+        if checkpoint > self.entries.len()
+            || self.entries[..checkpoint]
+                .iter()
+                .any(|entry| entry.op != OpType::Leaf)
+        {
+            return Err(TapeError::InvalidResetPoint(checkpoint));
+        }
+        let removed: Vec<_> = self.entries[checkpoint..]
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        self.entries.truncate(checkpoint);
+        for id in removed {
+            self.values.remove(&id);
+        }
+        self.index.clear();
+        for (position, entry) in self.entries.iter().enumerate() {
+            self.index.insert(entry.id, position);
+        }
+        self.next_id = self
+            .entries
+            .iter()
+            .map(|entry| entry.id + 1)
+            .max()
+            .unwrap_or(0);
+        Ok(())
     }
     pub fn add(&mut self, l: TensorId, r: TensorId) -> Result<TensorId, TapeError> {
         let (a, b) = (self.value(l)?.clone(), self.value(r)?.clone());
@@ -852,5 +907,25 @@ mod tests {
         let logits = Tensor::zeros(vec![3, 65]).unwrap();
         let loss = cross_entropy_value(logits, &[0, 17, 64]);
         assert!((loss - 65.0_f32.ln()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn reset_preserves_leaves_and_overwrite_rejects_computed_values() {
+        let mut tape = Tape::new();
+        let left = tape.leaf(Tensor::from_vec(vec![1], vec![1.0]).unwrap());
+        let right = tape.leaf(Tensor::from_vec(vec![1], vec![2.0]).unwrap());
+        let checkpoint = tape.entry_count();
+        let sum = tape.add(left, right).unwrap();
+        assert!(matches!(
+            tape.overwrite_leaf(sum, Tensor::from_vec(vec![1], vec![4.0]).unwrap()),
+            Err(TapeError::NonLeafUpdate(id)) if id == sum
+        ));
+        tape.overwrite_leaf(left, Tensor::from_vec(vec![1], vec![3.0]).unwrap())
+            .unwrap();
+        tape.reset(checkpoint).unwrap();
+        assert_eq!(tape.entry_count(), checkpoint);
+        assert_eq!(tape.value(left).unwrap().data(), &[3.0]);
+        assert_eq!(tape.value(right).unwrap().data(), &[2.0]);
+        assert!(matches!(tape.value(sum), Err(TapeError::UnknownTensor(id)) if id == sum));
     }
 }

@@ -264,7 +264,7 @@ pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, Te
 fn tape_tensor_error(error: TapeError) -> TensorError {
     match error {
         TapeError::Tensor(error) => error,
-        TapeError::UnknownTensor(id) => panic!("attention produced unknown tensor {id}"),
+        error => panic!("attention tape error: {error}"),
     }
 }
 #[cfg(test)]

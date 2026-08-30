@@ -258,6 +258,7 @@ pub struct Gpt {
     blocks: Vec<TransformerBlock>,
     final_norm: LayerNorm,
     output: Linear,
+    tape_checkpoint: usize,
     vocab_size: usize,
     block_size: usize,
 }
@@ -298,6 +299,7 @@ impl Gpt {
             .collect::<Result<Vec<_>, _>>()?;
         let final_norm = LayerNorm::new(&mut tape, n_embd, 1e-5)?;
         let output = Linear::new(&mut tape, n_embd, vocab_size, &mut initializer)?;
+        let tape_checkpoint = tape.entry_count();
         Ok(Self {
             tape,
             token_embedding,
@@ -305,6 +307,7 @@ impl Gpt {
             blocks,
             final_norm,
             output,
+            tape_checkpoint,
             vocab_size,
             block_size,
         })
@@ -325,6 +328,12 @@ impl Gpt {
             .into_iter()
             .map(|id| self.tape.value(id).cloned().map_err(GptError::from))
             .collect()
+    }
+    pub fn tape_entry_count(&self) -> usize {
+        self.tape.entry_count()
+    }
+    pub fn reset_tape(&mut self) -> Result<(), GptError> {
+        Ok(self.tape.reset(self.tape_checkpoint)?)
     }
 
     fn validate_tokens(&self, tokens: &[Vec<usize>]) -> Result<usize, GptError> {
@@ -365,16 +374,21 @@ impl Gpt {
     }
 
     pub fn forward(&mut self, tokens: &[Vec<usize>]) -> Result<Tensor, GptError> {
-        let sequence_length = self.validate_tokens(tokens)?;
-        let mut logits = Vec::with_capacity(tokens.len() * sequence_length * self.vocab_size);
-        for sequence in tokens {
-            let output = self.forward_sequence(sequence)?;
-            logits.extend_from_slice(self.tape.value(output)?.data());
-        }
-        Ok(
-            Tensor::from_vec(vec![tokens.len(), sequence_length, self.vocab_size], logits)
-                .map_err(TapeError::from)?,
-        )
+        self.reset_tape()?;
+        let result = (|| {
+            let sequence_length = self.validate_tokens(tokens)?;
+            let mut logits = Vec::with_capacity(tokens.len() * sequence_length * self.vocab_size);
+            for sequence in tokens {
+                let output = self.forward_sequence(sequence)?;
+                logits.extend_from_slice(self.tape.value(output)?.data());
+            }
+            Ok(
+                Tensor::from_vec(vec![tokens.len(), sequence_length, self.vocab_size], logits)
+                    .map_err(TapeError::from)?,
+            )
+        })();
+        self.reset_tape()?;
+        result
     }
 
     pub fn loss(
@@ -504,5 +518,23 @@ mod tests {
                 .flat_map(|id| gradients[id].data())
                 .any(|value| value.abs() > 1e-8)
         );
+    }
+
+    #[test]
+    fn gpt_reset_keeps_parameter_ids_and_values_without_growth() {
+        let mut model = Gpt::new_with_seed(17, 4, 1, 1, 8, 9).unwrap();
+        let parameters = model.parameters();
+        let values = model.parameter_values().unwrap();
+        let checkpoint = model.tape_entry_count();
+        let tokens = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]];
+        let targets = vec![vec![2, 3, 4, 5], vec![6, 7, 8, 9]];
+        for _ in 0..5 {
+            model.loss(&tokens, &targets).unwrap();
+            assert!(model.tape_entry_count() > checkpoint);
+            model.reset_tape().unwrap();
+            assert_eq!(model.tape_entry_count(), checkpoint);
+            assert_eq!(model.parameters(), parameters);
+            assert_eq!(model.parameter_values().unwrap(), values);
+        }
     }
 }
