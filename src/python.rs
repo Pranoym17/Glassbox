@@ -89,6 +89,8 @@ impl PyTensor {
         })
     }
 
+    /// Returns a shared-storage handle; eager Python tensors have no tape connection
+    /// to sever.
     fn detach(&self) -> Self {
         Self {
             inner: self.inner.detach(),

@@ -1,6 +1,6 @@
 # Glassbox
 
-Glassbox is a small Rust and CUDA deep-learning engine built to make tensor storage, kernels, autograd, and transformer execution inspectable.
+Glassbox is a CPU-tape-based autograd engine with a CUDA kernel library validated against CPU reference implementations.
 
 ## Build and test
 
@@ -12,7 +12,9 @@ maturin develop
 python python/tests/test_smoke.py
 ```
 
-The current GPT path executes on the CPU autograd tape and supports one attention head. CUDA operations currently copy host data to and from the device for each call. Persistent device buffers and end-to-end GPU model execution are planned for Week 8+.
+The GPT and optimizer training path runs entirely on CPU tensors backed by shared host memory and currently supports one attention head. The separate forward-only CUDA backend copies host data to the device for each operation and has no CUDA backward kernels. GPU-accelerated training would require persistent device storage plus CUDA backward implementations; it is a scoped-out next step and is not wired into the training path.
+
+At the Rust tape level, detach creates a new leaf that severs the source graph connection while sharing the same CPU storage. Eager Python tensors do not carry a tape connection, so Python detach currently returns a separate shared-storage handle but has no gradient graph to sever.
 
 ## Train
 

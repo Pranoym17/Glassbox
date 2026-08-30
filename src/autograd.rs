@@ -201,6 +201,7 @@ impl Tape {
             .unwrap_or(0);
         Ok(())
     }
+    /// Creates a new leaf that shares the value but has no edge to the source graph.
     pub fn detach(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
         let value = self.value(input)?.detach();
         Ok(self.leaf(value))

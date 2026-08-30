@@ -124,6 +124,7 @@ impl Tensor {
         &self.data
     }
 
+    /// Returns a new tensor handle that shares this tensor's CPU storage.
     pub fn detach(&self) -> Self {
         self.clone()
     }
