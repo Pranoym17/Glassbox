@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 pub mod autograd;
 pub mod data;
@@ -13,7 +14,7 @@ pub mod visualizer;
 pub struct Tensor {
     shape: Vec<usize>,
     strides: Vec<usize>,
-    data: Vec<f32>,
+    data: Arc<Vec<f32>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,7 +100,7 @@ impl Tensor {
         Ok(Self {
             strides: contiguous_strides(&shape),
             shape,
-            data,
+            data: Arc::new(data),
         })
     }
 
@@ -120,6 +121,10 @@ impl Tensor {
     }
     pub fn data(&self) -> &[f32] {
         &self.data
+    }
+
+    pub fn detach(&self) -> Self {
+        self.clone()
     }
 
     pub fn is_contiguous(&self) -> bool {
@@ -162,11 +167,23 @@ impl Tensor {
         Self {
             shape: self.shape.clone(),
             strides: output_strides,
-            data,
+            data: Arc::new(data),
         }
     }
     pub fn reshape(&self, shape: Vec<usize>) -> Result<Self, TensorError> {
-        Self::from_vec(shape, self.contiguous().data)
+        let input = self.contiguous();
+        let expected = numel(&shape);
+        if input.data.len() != expected {
+            return Err(TensorError::DataLengthMismatch {
+                expected,
+                actual: input.data.len(),
+            });
+        }
+        Ok(Self {
+            strides: contiguous_strides(&shape),
+            shape,
+            data: input.data,
+        })
     }
 
     pub fn add(&self, rhs: &Self) -> Result<Self, TensorError> {
@@ -200,7 +217,7 @@ impl Tensor {
         Ok(left
             .data
             .iter()
-            .zip(&right.data)
+            .zip(right.data.iter())
             .all(|(&a, &b)| (a - b).abs() <= atol + rtol * b.abs()))
     }
 
@@ -308,7 +325,10 @@ impl Tensor {
 
     fn unary_op(&self, operation: impl Fn(f32) -> f32) -> Result<Self, TensorError> {
         let input = self.contiguous();
-        Self::from_vec(input.shape, input.data.into_iter().map(operation).collect())
+        Self::from_vec(
+            input.shape,
+            input.data.iter().copied().map(operation).collect(),
+        )
     }
 
     fn binary_op(
@@ -322,8 +342,9 @@ impl Tensor {
         Self::from_vec(
             output_shape,
             left.data
-                .into_iter()
-                .zip(right.data)
+                .iter()
+                .copied()
+                .zip(right.data.iter().copied())
                 .map(|(a, b)| operation(a, b))
                 .collect(),
         )
@@ -517,5 +538,13 @@ mod tests {
                 right: vec![1, 3]
             }
         );
+    }
+
+    #[test]
+    fn detach_shares_storage() {
+        let tensor = Tensor::from_vec(vec![2], vec![1.0, 2.0]).unwrap();
+        let detached = tensor.detach();
+        assert!(std::sync::Arc::ptr_eq(&tensor.data, &detached.data));
+        assert_eq!(detached, tensor);
     }
 }

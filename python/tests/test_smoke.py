@@ -15,6 +15,9 @@ near = gb.Tensor([1.000001, 1.999999, 3.000001, 3.999999], [2, 2])
 assert gb.isclose(near, left)
 assert near.isclose(left)
 assert not gb.isclose(gb.Tensor([1.1, 2.0, 3.0, 4.0], [2, 2]), left)
+detached = left.detach()
+assert detached.data == left.data
+assert detached is not left
 
 try:
     gb.Tensor([1.0], [2])

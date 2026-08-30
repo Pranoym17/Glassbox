@@ -70,6 +70,12 @@ impl PyTensor {
         })
     }
 
+    fn detach(&self) -> Self {
+        Self {
+            inner: self.inner.detach(),
+        }
+    }
+
     #[pyo3(signature = (other, atol = 1e-8, rtol = 1e-5))]
     fn isclose(&self, other: &Self, atol: f32, rtol: f32) -> PyResult<bool> {
         self.inner

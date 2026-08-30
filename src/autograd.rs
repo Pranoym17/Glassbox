@@ -192,6 +192,10 @@ impl Tape {
             .unwrap_or(0);
         Ok(())
     }
+    pub fn detach(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
+        let value = self.value(input)?.detach();
+        Ok(self.leaf(value))
+    }
     pub fn add(&mut self, l: TensorId, r: TensorId) -> Result<TensorId, TapeError> {
         let (a, b) = (self.value(l)?.clone(), self.value(r)?.clone());
         let out = a.add(&b)?;
@@ -941,6 +945,19 @@ mod tests {
             .iter()
             .sum()
         });
+    }
+
+    #[test]
+    fn detach_stops_gradient_flow() {
+        let mut tape = Tape::new();
+        let input = tape.leaf(Tensor::from_vec(vec![2], vec![2.0, 3.0]).unwrap());
+        let tracked = tape.mul(input, input).unwrap();
+        let detached = tape.detach(tracked).unwrap();
+        let loss = tape.mul(detached, detached).unwrap();
+        let gradients = tape.backward(loss).unwrap();
+        assert!(!gradients.contains_key(&input));
+        assert!(!gradients.contains_key(&tracked));
+        assert_eq!(gradients[&detached].data(), &[8.0, 18.0]);
     }
 
     fn cross_entropy_value(logits: Tensor, targets: &[usize]) -> f32 {
