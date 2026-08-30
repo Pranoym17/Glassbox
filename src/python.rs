@@ -6,6 +6,7 @@ use crate::nn::{
     Module as RustModule,
 };
 use crate::optim::{Adam, clip_gradients, gradient_norms};
+use crate::visualizer::VisualizerServer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -218,6 +219,9 @@ impl PyEmbedding {
 pub struct PyGpt {
     model: Gpt,
     optimizer: Adam,
+    visualizer: Option<VisualizerServer>,
+    step: u64,
+    trace_interval: u64,
 }
 
 #[pymethods]
@@ -238,6 +242,9 @@ impl PyGpt {
         Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self {
             model,
             optimizer: Adam::new(learning_rate, 0.9, 0.999, 1e-8),
+            visualizer: None,
+            step: 0,
+            trace_interval: 1,
         }))
     }
 
@@ -254,19 +261,60 @@ impl PyGpt {
         targets: Vec<Vec<usize>>,
         maximum_norm: f32,
     ) -> PyResult<(f32, Vec<f32>)> {
-        self.model.reset_tape().map_err(value_error)?;
-        let loss = self.model.loss(&tokens, &targets).map_err(value_error)?;
-        let value = self.model.loss_value(loss).map_err(value_error)?;
-        let mut gradients = self.model.backward(loss).map_err(value_error)?;
-        let parameters = self.model.parameters();
-        let norms = gradient_norms(&parameters, &gradients);
-        clip_gradients(&parameters, &mut gradients, maximum_norm).map_err(value_error)?;
-        self.optimizer
-            .step(self.model.tape_mut(), &parameters, &gradients)
-            .map_err(value_error)?;
-        self.optimizer.zero_grad(&mut gradients);
-        self.model.reset_tape().map_err(value_error)?;
-        Ok((value, norms))
+        let traced = self.visualizer.is_some() && self.step.is_multiple_of(self.trace_interval);
+        self.model.set_trace(self.step, traced);
+        let result: PyResult<(f32, Vec<f32>)> = (|| {
+            self.model.reset_tape().map_err(value_error)?;
+            let loss = self.model.loss(&tokens, &targets).map_err(value_error)?;
+            let value = self.model.loss_value(loss).map_err(value_error)?;
+            let mut gradients = self.model.backward(loss).map_err(value_error)?;
+            let parameters = self.model.parameters();
+            let norms = gradient_norms(&parameters, &gradients);
+            clip_gradients(&parameters, &mut gradients, maximum_norm).map_err(value_error)?;
+            self.optimizer
+                .step(self.model.tape_mut(), &parameters, &gradients)
+                .map_err(value_error)?;
+            self.optimizer.zero_grad(&mut gradients);
+            self.model.reset_tape().map_err(value_error)?;
+            Ok((value, norms))
+        })();
+        self.model.set_trace(self.step, false);
+        if result.is_ok() {
+            self.step += 1;
+        }
+        result
+    }
+
+    #[pyo3(signature = (port = 8080, trace_interval = 50, capacity = 8192))]
+    fn enable_visualizer(
+        &mut self,
+        port: u16,
+        trace_interval: u64,
+        capacity: usize,
+    ) -> PyResult<String> {
+        if trace_interval == 0 {
+            return Err(PyValueError::new_err("trace_interval must be positive"));
+        }
+        self.disable_visualizer();
+        let server = VisualizerServer::start(port, capacity).map_err(value_error)?;
+        let url = server.url();
+        self.model.set_event_emitter(Some(server.emitter()));
+        self.trace_interval = trace_interval;
+        self.visualizer = Some(server);
+        Ok(url)
+    }
+
+    fn disable_visualizer(&mut self) {
+        self.model.set_event_emitter(None);
+        self.model.set_trace(self.step, false);
+        self.visualizer = None;
+    }
+
+    fn dropped_events(&self) -> u64 {
+        self.visualizer
+            .as_ref()
+            .map(VisualizerServer::dropped)
+            .unwrap_or(0)
     }
 
     fn evaluate(&mut self, tokens: Vec<Vec<usize>>, targets: Vec<Vec<usize>>) -> PyResult<f32> {

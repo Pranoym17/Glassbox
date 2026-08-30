@@ -32,3 +32,11 @@ The script reports step-0 loss against `ln(vocab_size)`, validation loss, and ev
 Tracing is opt-in and interval-based. Untraced tape operations return before an event or JSON string is built, preserving the normal training path. Traced events enter a bounded channel with `try_send`; a full channel drops the event and increments an exposed counter instead of blocking training.
 
 The browser receives the one-way event stream over Server-Sent Events. SSE matches the server-to-browser data flow, reconnects natively through `EventSource`, and avoids the protocol and dependency cost of WebSockets. A background `std::net::TcpListener` serves both the static page and `/events` from the training process. It listens on `127.0.0.1:8080` by default and accepts a configurable port.
+
+Enable a live trace from the training example with:
+
+```bash
+python examples/train.py --steps 100 --visualizer --trace-interval 10
+```
+
+The Python `GPT.enable_visualizer(port=8080, trace_interval=50, capacity=8192)` method returns the page URL. `GPT.dropped_events()` reports queue overflow, and `GPT.disable_visualizer()` removes the emitter.

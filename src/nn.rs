@@ -1,6 +1,7 @@
 use crate::Tensor;
 use crate::autograd::{Tape, TapeError, TensorId};
 use crate::transformer::causal_attention_tape;
+use crate::visualizer::EventEmitter;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -347,6 +348,12 @@ impl Gpt {
     pub fn reset_tape(&mut self) -> Result<(), GptError> {
         Ok(self.tape.reset(self.tape_checkpoint)?)
     }
+    pub fn set_event_emitter(&mut self, emitter: Option<EventEmitter>) {
+        self.tape.set_event_emitter(emitter);
+    }
+    pub fn set_trace(&mut self, step: u64, enabled: bool) {
+        self.tape.set_trace(step, enabled);
+    }
 
     fn validate_tokens(&self, tokens: &[Vec<usize>]) -> Result<usize, GptError> {
         let Some(first) = tokens.first() else {
@@ -639,5 +646,44 @@ mod tests {
         let actual = loaded.forward(&tokens).unwrap();
         assert_eq!(actual, expected);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn traced_gpt_is_numerically_identical_and_phase_ordered() {
+        let tokens = vec![vec![1, 2, 3, 4]];
+        let targets = vec![vec![2, 3, 4, 5]];
+        let mut plain = Gpt::new_with_seed(17, 4, 1, 1, 8, 42).unwrap();
+        let mut traced = Gpt::new_with_seed(17, 4, 1, 1, 8, 42).unwrap();
+        let (emitter, receiver) = crate::visualizer::event_channel(2048);
+        traced.set_event_emitter(Some(emitter.clone()));
+        traced.set_trace(3, true);
+
+        let plain_loss = plain.loss(&tokens, &targets).unwrap();
+        let traced_loss = traced.loss(&tokens, &targets).unwrap();
+        assert_eq!(
+            plain.loss_value(plain_loss).unwrap().to_bits(),
+            traced.loss_value(traced_loss).unwrap().to_bits()
+        );
+        assert_eq!(
+            plain.backward(plain_loss).unwrap(),
+            traced.backward(traced_loss).unwrap()
+        );
+        assert_eq!(emitter.dropped(), 0);
+
+        let events: Vec<_> = receiver.try_iter().collect();
+        let backward = events
+            .iter()
+            .position(|event| event.contains("\"phase\":\"backward\""))
+            .unwrap();
+        assert!(
+            events[..backward]
+                .iter()
+                .all(|event| event.contains("\"phase\":\"forward\""))
+        );
+        assert!(
+            events[backward..]
+                .iter()
+                .all(|event| event.contains("\"phase\":\"backward\""))
+        );
     }
 }

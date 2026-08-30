@@ -38,11 +38,15 @@ dataset = gb.data.CharDataset("data/tinyshakespeare.txt", 4, seed=42)
 assert dataset.vocab_size == 65
 inputs, targets = dataset.batch("train", 2)
 trainer = gb.nn.GPT(65, 4, 1, 1, 8, seed=42, learning_rate=1e-2)
+url = trainer.enable_visualizer(port=0, trace_interval=1)
+assert url.startswith("http://127.0.0.1:")
 initial = trainer.evaluate(inputs, targets)
 loss, norms = trainer.train_step(inputs, targets)
 assert math.isfinite(loss)
 assert abs(loss - initial) < 1e-6
 assert len(norms) == len(trainer.parameters())
+assert trainer.dropped_events() == 0
+trainer.disable_visualizer()
 assert all(math.isfinite(norm) for norm in norms)
 
 checkpoint = tempfile.NamedTemporaryFile(suffix=".gbx", delete=False)

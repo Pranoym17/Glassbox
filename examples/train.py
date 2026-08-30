@@ -19,6 +19,9 @@ def main():
     parser.add_argument("--overfit", action="store_true")
     parser.add_argument("--output", default="artifacts/loss_curve.csv")
     parser.add_argument("--checkpoint", default="artifacts/tinyshakespeare.gbx")
+    parser.add_argument("--visualizer", action="store_true")
+    parser.add_argument("--visualizer-port", type=int, default=8080)
+    parser.add_argument("--trace-interval", type=int, default=50)
     args = parser.parse_args()
 
     dataset = gb.data.CharDataset(
@@ -33,6 +36,13 @@ def main():
         seed=args.seed,
         learning_rate=args.learning_rate,
     )
+
+    if args.visualizer:
+        url = model.enable_visualizer(
+            port=args.visualizer_port,
+            trace_interval=args.trace_interval,
+        )
+        print(f"visualizer={url}")
     fixed_batch = (
         dataset.batch("train", args.batch_size) if args.overfit else None
     )
@@ -76,6 +86,9 @@ def main():
     model.save_checkpoint(str(checkpoint))
     print(f"loss_curve={output}")
     print(f"checkpoint={checkpoint}")
+
+    if args.visualizer:
+        print(f"visualizer_dropped_events={model.dropped_events()}")
 
 
 if __name__ == "__main__":
