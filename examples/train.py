@@ -68,7 +68,7 @@ def main():
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="") as file:
-        writer = csv.writer(file)
+        writer = csv.writer(file, lineterminator="\n")
         writer.writerow(["step", "train_loss", "validation_loss"])
         writer.writerows(curve)
     checkpoint = Path(args.checkpoint)
