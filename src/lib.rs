@@ -204,6 +204,15 @@ impl Tensor {
     pub fn log(&self) -> Result<Self, TensorError> {
         self.unary_op(f32::ln)
     }
+    pub fn relu(&self) -> Result<Self, TensorError> {
+        self.unary_op(|value| value.max(0.0))
+    }
+    pub fn sigmoid(&self) -> Result<Self, TensorError> {
+        self.unary_op(|value| 1.0 / (1.0 + (-value).exp()))
+    }
+    pub fn tanh(&self) -> Result<Self, TensorError> {
+        self.unary_op(f32::tanh)
+    }
 
     pub fn is_close(&self, rhs: &Self, atol: f32, rtol: f32) -> Result<bool, TensorError> {
         if self.shape != rhs.shape {
@@ -546,5 +555,29 @@ mod tests {
         let detached = tensor.detach();
         assert!(std::sync::Arc::ptr_eq(&tensor.data, &detached.data));
         assert_eq!(detached, tensor);
+    }
+
+    #[test]
+    fn activation_ops_match_scalar_references() {
+        let values = Tensor::from_vec(vec![3], vec![-1.0, 0.0, 1.0]).unwrap();
+        assert_eq!(values.relu().unwrap().data(), &[0.0, 0.0, 1.0]);
+        for (actual, expected) in values
+            .sigmoid()
+            .unwrap()
+            .data()
+            .iter()
+            .zip([0.26894143, 0.5, 0.7310586])
+        {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        let tanh_reference =
+            Tensor::from_vec(vec![3], vec![-1.0_f32.tanh(), 0.0, 1.0_f32.tanh()]).unwrap();
+        assert!(
+            values
+                .tanh()
+                .unwrap()
+                .is_close(&tanh_reference, 1e-6, 1e-6)
+                .unwrap()
+        );
     }
 }

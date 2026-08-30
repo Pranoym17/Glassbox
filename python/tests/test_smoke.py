@@ -29,10 +29,20 @@ else:
 linear = gb.nn.Linear(2, 3)
 norm = gb.nn.LayerNorm(2)
 embedding = gb.nn.Embedding(65, 8)
+relu = gb.nn.ReLU()
+sigmoid = gb.nn.Sigmoid()
+tanh = gb.nn.Tanh()
 assert isinstance(linear, gb.nn.Module)
+assert isinstance(relu, gb.nn.Module)
 assert linear.forward(left).shape == [2, 3]
 assert norm.forward(left).shape == [2, 2]
 assert embedding.forward([1, 4, 1]).shape == [3, 8]
+assert relu.forward(gb.Tensor([-1.0, 0.0, 1.0], [3])).data == [0.0, 0.0, 1.0]
+assert gb.isclose(sigmoid.forward(gb.Tensor([0.0], [1])), gb.Tensor([0.5], [1]))
+assert gb.isclose(tanh.forward(gb.Tensor([0.0], [1])), gb.Tensor([0.0], [1]))
+assert left.relu().shape == left.shape
+assert left.sigmoid().shape == left.shape
+assert left.tanh().shape == left.shape
 
 random.seed(42)
 tokens = [[random.randrange(65) for _ in range(16)] for _ in range(2)]

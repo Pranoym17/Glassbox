@@ -19,6 +19,9 @@ pub enum OpType {
     Embedding,
     LayerNorm,
     Gelu,
+    Relu,
+    Sigmoid,
+    Tanh,
     Reshape,
     CrossEntropy,
 }
@@ -36,6 +39,9 @@ impl OpType {
             Self::Embedding => "embedding",
             Self::LayerNorm => "layer_norm",
             Self::Gelu => "gelu",
+            Self::Relu => "relu",
+            Self::Sigmoid => "sigmoid",
+            Self::Tanh => "tanh",
             Self::Reshape => "reshape",
             Self::CrossEntropy => "cross_entropy",
         }
@@ -65,6 +71,9 @@ pub enum SavedContext {
     },
     Gelu {
         input: Tensor,
+    },
+    Activation {
+        output: Tensor,
     },
     Reshape {
         input_shape: Vec<usize>,
@@ -341,6 +350,39 @@ impl Tape {
             output,
         ))
     }
+    pub fn relu(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
+        let output = self.value(input)?.relu()?;
+        Ok(self.append(
+            OpType::Relu,
+            vec![input],
+            SavedContext::Activation {
+                output: output.clone(),
+            },
+            output,
+        ))
+    }
+    pub fn sigmoid(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
+        let output = self.value(input)?.sigmoid()?;
+        Ok(self.append(
+            OpType::Sigmoid,
+            vec![input],
+            SavedContext::Activation {
+                output: output.clone(),
+            },
+            output,
+        ))
+    }
+    pub fn tanh(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
+        let output = self.value(input)?.tanh()?;
+        Ok(self.append(
+            OpType::Tanh,
+            vec![input],
+            SavedContext::Activation {
+                output: output.clone(),
+            },
+            output,
+        ))
+    }
     pub fn reshape(&mut self, input: TensorId, shape: Vec<usize>) -> Result<TensorId, TapeError> {
         let input_shape = self.value(input)?.shape().to_vec();
         let output = self.value(input)?.reshape(shape)?;
@@ -511,6 +553,39 @@ impl Tape {
                     let derivative = Tensor::from_vec(
                         input.shape().to_vec(),
                         input.data().iter().copied().map(gelu_derivative).collect(),
+                    )?;
+                    self.acc(&mut g, e.inputs[0], up.mul(&derivative)?)?
+                }
+                (OpType::Relu, SavedContext::Activation { output }) => {
+                    let derivative = Tensor::from_vec(
+                        output.shape().to_vec(),
+                        output
+                            .data()
+                            .iter()
+                            .map(|value| if *value > 0.0 { 1.0 } else { 0.0 })
+                            .collect(),
+                    )?;
+                    self.acc(&mut g, e.inputs[0], up.mul(&derivative)?)?
+                }
+                (OpType::Sigmoid, SavedContext::Activation { output }) => {
+                    let derivative = Tensor::from_vec(
+                        output.shape().to_vec(),
+                        output
+                            .data()
+                            .iter()
+                            .map(|value| value * (1.0 - value))
+                            .collect(),
+                    )?;
+                    self.acc(&mut g, e.inputs[0], up.mul(&derivative)?)?
+                }
+                (OpType::Tanh, SavedContext::Activation { output }) => {
+                    let derivative = Tensor::from_vec(
+                        output.shape().to_vec(),
+                        output
+                            .data()
+                            .iter()
+                            .map(|value| 1.0 - value * value)
+                            .collect(),
                     )?;
                     self.acc(&mut g, e.inputs[0], up.mul(&derivative)?)?
                 }
@@ -958,6 +1033,29 @@ mod tests {
         assert!(!gradients.contains_key(&input));
         assert!(!gradients.contains_key(&tracked));
         assert_eq!(gradients[&detached].data(), &[8.0, 18.0]);
+    }
+
+    #[test]
+    fn activation_backwards_match_finite_differences() {
+        let values = Tensor::from_vec(vec![4], vec![-1.2, -0.4, 0.3, 1.5]).unwrap();
+        for activation in 0..3 {
+            let mut tape = Tape::new();
+            let input = tape.leaf(values.clone());
+            let output = match activation {
+                0 => tape.relu(input).unwrap(),
+                1 => tape.sigmoid(input).unwrap(),
+                _ => tape.tanh(input).unwrap(),
+            };
+            let gradients = tape.backward(output).unwrap();
+            check_gradient(&gradients[&input], &values, |value| {
+                let output = match activation {
+                    0 => value.relu().unwrap(),
+                    1 => value.sigmoid().unwrap(),
+                    _ => value.tanh().unwrap(),
+                };
+                output.data().iter().sum()
+            });
+        }
     }
 
     fn cross_entropy_value(logits: Tensor, targets: &[usize]) -> f32 {

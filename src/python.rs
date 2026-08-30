@@ -70,6 +70,24 @@ impl PyTensor {
         })
     }
 
+    fn relu(&self) -> PyResult<Self> {
+        Ok(Self {
+            inner: self.inner.relu().map_err(value_error)?,
+        })
+    }
+
+    fn sigmoid(&self) -> PyResult<Self> {
+        Ok(Self {
+            inner: self.inner.sigmoid().map_err(value_error)?,
+        })
+    }
+
+    fn tanh(&self) -> PyResult<Self> {
+        Ok(Self {
+            inner: self.inner.tanh().map_err(value_error)?,
+        })
+    }
+
     fn detach(&self) -> Self {
         Self {
             inner: self.inner.detach(),
@@ -121,6 +139,57 @@ fn isclose(left: &PyTensor, right: &PyTensor, atol: f32, rtol: f32) -> PyResult<
     left.inner
         .is_close(&right.inner, atol, rtol)
         .map_err(value_error)
+}
+
+#[pyclass(name = "ReLU", extends = PyModuleBase, module = "glassbox.nn")]
+pub struct PyReLU;
+
+#[pymethods]
+impl PyReLU {
+    #[new]
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyModuleBase).add_subclass(Self)
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        Ok(PyTensor {
+            inner: input.inner.relu().map_err(value_error)?,
+        })
+    }
+}
+
+#[pyclass(name = "Sigmoid", extends = PyModuleBase, module = "glassbox.nn")]
+pub struct PySigmoid;
+
+#[pymethods]
+impl PySigmoid {
+    #[new]
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyModuleBase).add_subclass(Self)
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        Ok(PyTensor {
+            inner: input.inner.sigmoid().map_err(value_error)?,
+        })
+    }
+}
+
+#[pyclass(name = "Tanh", extends = PyModuleBase, module = "glassbox.nn")]
+pub struct PyTanh;
+
+#[pymethods]
+impl PyTanh {
+    #[new]
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyModuleBase).add_subclass(Self)
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        Ok(PyTensor {
+            inner: input.inner.tanh().map_err(value_error)?,
+        })
+    }
 }
 
 fn parameters(tape: &Tape, ids: Vec<TensorId>) -> PyResult<Vec<PyTensor>> {
@@ -417,6 +486,9 @@ pub fn glassbox(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     nn.add_class::<PyLinear>()?;
     nn.add_class::<PyLayerNorm>()?;
     nn.add_class::<PyEmbedding>()?;
+    nn.add_class::<PyReLU>()?;
+    nn.add_class::<PySigmoid>()?;
+    nn.add_class::<PyTanh>()?;
     nn.add_class::<PyGpt>()?;
     module.add_submodule(&nn)?;
     let data = PyModule::new(py, "glassbox.data")?;

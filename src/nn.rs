@@ -113,6 +113,28 @@ impl Module for LayerNorm {
     }
 }
 
+macro_rules! activation_module {
+    ($name:ident, $operation:ident) => {
+        pub struct $name;
+
+        impl Module for $name {
+            type Input = TensorId;
+
+            fn parameters(&self) -> Vec<TensorId> {
+                vec![]
+            }
+
+            fn forward(&self, tape: &mut Tape, input: TensorId) -> Result<TensorId, TapeError> {
+                tape.$operation(input)
+            }
+        }
+    };
+}
+
+activation_module!(ReLU, relu);
+activation_module!(Sigmoid, sigmoid);
+activation_module!(Tanh, tanh);
+
 pub struct Embedding {
     table: TensorId,
 }
@@ -562,6 +584,24 @@ mod tests {
         assert_eq!(embedding.parameters().len(), 1);
         assert_eq!(norm.parameters().len(), 2);
         assert_eq!(linear.parameters().len(), 2);
+    }
+
+    #[test]
+    fn activation_modules_are_stateless_and_shape_preserving() {
+        let mut tape = Tape::new();
+        let input = tape.leaf(Tensor::from_vec(vec![3], vec![-1.0, 0.0, 1.0]).unwrap());
+        let relu = ReLU;
+        let sigmoid = Sigmoid;
+        let tanh = Tanh;
+        let relu_output = relu.forward(&mut tape, input).unwrap();
+        let sigmoid_output = sigmoid.forward(&mut tape, input).unwrap();
+        let tanh_output = tanh.forward(&mut tape, input).unwrap();
+        assert_eq!(tape.value(relu_output).unwrap().data(), &[0.0, 0.0, 1.0]);
+        assert_eq!(tape.value(sigmoid_output).unwrap().shape(), &[3]);
+        assert_eq!(tape.value(tanh_output).unwrap().shape(), &[3]);
+        assert!(relu.parameters().is_empty());
+        assert!(sigmoid.parameters().is_empty());
+        assert!(tanh.parameters().is_empty());
     }
 
     #[test]
