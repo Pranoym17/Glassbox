@@ -3,41 +3,103 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Glassbox Event Stream</title>
+  <title>Glassbox Autograd</title>
   <style>
-    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-    body { margin: 0; background: #101418; color: #d8e1e8; }
-    main { max-width: 880px; margin: 10vh auto; padding: 2rem; }
-    h1 { font-size: 1.35rem; font-weight: 600; }
-    .status { display: flex; gap: 2rem; padding: 1rem; border: 1px solid #34414a; border-radius: .5rem; background: #171d22; }
-    .value { color: #7dd3fc; }
-    p { color: #94a3b8; line-height: 1.6; }
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; height: 100vh; overflow: hidden; background: #0b1015; color: #dce7ef; }
+    button, select, input { font: inherit; }
+    header { height: 58px; display: flex; align-items: center; gap: 18px; padding: 0 20px; border-bottom: 1px solid #26333d; background: #111820; }
+    h1 { margin: 0; font: 600 16px ui-monospace, monospace; letter-spacing: .04em; }
+    .tag { color: #7dd3fc; font-size: 12px; }
+    #connection { margin-left: auto; color: #94a3b8; font-size: 12px; }
+    main { display: grid; grid-template-columns: 260px 1fr; height: calc(100vh - 58px); }
+    aside { padding: 16px; overflow: auto; border-right: 1px solid #26333d; background: #0f161d; }
+    section { position: relative; min-width: 0; }
+    .group { margin-bottom: 20px; }
+    .group h2 { margin: 0 0 9px; color: #738495; font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+    .row { display: flex; gap: 7px; align-items: center; margin: 7px 0; }
+    button, select, .file-label { border: 1px solid #344654; border-radius: 5px; background: #17222b; color: #dce7ef; padding: 7px 9px; cursor: pointer; }
+    button:hover, .file-label:hover { border-color: #60a5fa; }
+    button:disabled { opacity: .4; cursor: default; }
+    .file-label input { display: none; }
+    input[type="range"] { width: 100%; accent-color: #38bdf8; }
+    input[type="checkbox"] { accent-color: #38bdf8; }
+    .stats { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; color: #94a3b8; font: 12px ui-monospace, monospace; }
+    .stats output { color: #e2e8f0; text-align: right; }
+    #graph { width: 100%; height: 100%; background: radial-gradient(circle at 50% 45%, #121c24, #0b1015 70%); }
+    #banner { position: absolute; z-index: 2; top: 16px; left: 50%; transform: translateX(-50%); max-width: 80%; padding: 10px 14px; border: 1px solid #ef4444; border-radius: 6px; background: #451a1a; color: #fecaca; font-size: 13px; }
+    #banner[hidden] { display: none; }
+    .node rect { fill: #1d2933; stroke: #435462; stroke-width: 1.5; }
+    .node.forward rect { fill: #12364a; stroke: #38bdf8; }
+    .node.backward rect { stroke: #fb923c; }
+    .node text { pointer-events: none; fill: #e5edf3; font: 11px ui-monospace, monospace; }
+    .node .shape { fill: #91a4b3; font-size: 9px; }
+    .edge { fill: none; stroke: #3b82f6; stroke-width: 1.25; opacity: .38; }
+    .edge-label { fill: #708596; font: 8px ui-monospace, monospace; text-anchor: middle; }
+    .backward-edge { fill: none; stroke: #fb923c; }
+    .legend { color: #91a4b3; font: 11px ui-monospace, monospace; line-height: 1.7; }
+    .swatch { display: inline-block; width: 18px; height: 3px; margin-right: 6px; vertical-align: middle; }
+    #empty { position: absolute; inset: 0; display: grid; place-items: center; color: #627482; pointer-events: none; }
   </style>
 </head>
 <body>
+  <header>
+    <h1>GLASSBOX</h1>
+    <span class="tag">autograd event visualizer</span>
+    <span id="connection">fixture mode</span>
+  </header>
   <main>
-    <h1>Glassbox Event Stream</h1>
-    <div class="status">
-      <span>connection <strong class="value" id="connection">connecting</strong></span>
-      <span>step <strong class="value" id="step">-</strong></span>
-      <span>events <strong class="value" id="count">0</strong></span>
-    </div>
-    <p>The Week 6 transport is live. Events are logged to the browser console; graph rendering is added in Week 7.</p>
+    <aside>
+      <div class="group">
+        <h2>Fixture</h2>
+        <div class="row">
+          <button id="load-tiny">tiny step</button>
+          <button id="load-full">full step</button>
+        </div>
+        <label class="file-label">open JSON<input id="file" type="file" accept=".json,application/json"></label>
+        <div class="row"><label><input id="first-sequence" type="checkbox" checked> first sequence only</label></div>
+      </div>
+      <div class="group">
+        <h2>Replay</h2>
+        <div class="row">
+          <button id="previous" aria-label="previous event">&lt;</button>
+          <button id="play">play</button>
+          <button id="next" aria-label="next event">&gt;</button>
+          <select id="speed" aria-label="replay speed">
+            <option value="2">2/s</option>
+            <option value="8" selected>8/s</option>
+            <option value="24">24/s</option>
+            <option value="60">60/s</option>
+          </select>
+        </div>
+        <input id="scrub" type="range" min="0" max="0" value="0">
+      </div>
+      <div class="group">
+        <h2>Step</h2>
+        <div class="stats">
+          <span>source</span><output id="source">none</output>
+          <span>step</span><output id="step">-</output>
+          <span>event</span><output id="event-count">0 / 0</output>
+          <span>nodes</span><output id="node-count">0</output>
+          <span>edges</span><output id="edge-count">0</output>
+        </div>
+      </div>
+      <div class="group legend">
+        <h2>Legend</h2>
+        <div><span class="swatch" style="background:#38bdf8"></span>forward</div>
+        <div><span class="swatch" style="background:#fb923c"></span>backward</div>
+        <div>gradient norm (log)</div>
+        <div><span id="grad-min">-</span> -&gt; <span id="grad-max">-</span></div>
+      </div>
+    </aside>
+    <section>
+      <div id="banner" hidden></div>
+      <div id="empty">Load a captured step to inspect its graph.</div>
+      <svg id="graph" role="img" aria-label="Autograd tensor graph"></svg>
+    </section>
   </main>
-  <script>
-    const connection = document.querySelector("#connection");
-    const count = document.querySelector("#count");
-    const step = document.querySelector("#step");
-    let seen = 0;
-    const source = new EventSource("/events");
-    source.onopen = () => connection.textContent = "live";
-    source.onerror = () => connection.textContent = "reconnecting";
-    source.onmessage = message => {
-      const event = JSON.parse(message.data);
-      count.textContent = ++seen;
-      step.textContent = event.step;
-      console.log(event);
-    };
-  </script>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

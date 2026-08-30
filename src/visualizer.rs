@@ -93,6 +93,9 @@ pub fn event_channel(capacity: usize) -> (EventEmitter, Receiver<String>) {
 
 pub const DEFAULT_PORT: u16 = 8080;
 const INDEX_HTML: &str = include_str!("../visualizer/index.html");
+const APP_JS: &str = include_str!("../visualizer/app.js");
+const STEP_JSON: &str = include_str!("../visualizer/fixtures/step.json");
+const TINY_STEP_JSON: &str = include_str!("../visualizer/fixtures/tiny_step.json");
 
 pub struct VisualizerServer {
     emitter: EventEmitter,
@@ -205,13 +208,15 @@ fn handle_connection(mut stream: TcpStream, clients: &Arc<Mutex<Vec<TcpStream>>>
         }
         return;
     }
-    if path == "/" || path == "/index.html" {
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            INDEX_HTML.len()
-        );
-        let _ = stream.write_all(headers.as_bytes());
-        let _ = stream.write_all(INDEX_HTML.as_bytes());
+    let asset = match path {
+        "/" | "/index.html" => Some((INDEX_HTML, "text/html; charset=utf-8")),
+        "/app.js" => Some((APP_JS, "text/javascript; charset=utf-8")),
+        "/fixtures/step.json" => Some((STEP_JSON, "application/json")),
+        "/fixtures/tiny_step.json" => Some((TINY_STEP_JSON, "application/json")),
+        _ => None,
+    };
+    if let Some((body, content_type)) = asset {
+        serve_asset(&mut stream, body, content_type);
         return;
     }
     let body = "not found";
@@ -220,6 +225,14 @@ fn handle_connection(mut stream: TcpStream, clients: &Arc<Mutex<Vec<TcpStream>>>
         body.len()
     );
     let _ = stream.write_all(response.as_bytes());
+}
+fn serve_asset(stream: &mut TcpStream, body: &str, content_type: &str) {
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(headers.as_bytes());
+    let _ = stream.write_all(body.as_bytes());
 }
 
 fn push_usize_array(output: &mut String, values: &[usize]) {
@@ -313,7 +326,19 @@ mod tests {
         let mut response = String::new();
         page.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.contains("Glassbox Event Stream"));
+        assert!(response.contains("<script type=\"module\" src=\"app.js\">"));
+
+        let mut fixture = TcpStream::connect(server.address()).unwrap();
+        fixture
+            .write_all(b"GET /fixtures/tiny_step.json HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        fixture
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut fixture_response = String::new();
+        fixture.read_to_string(&mut fixture_response).unwrap();
+        assert!(fixture_response.contains("Content-Type: application/json"));
+        assert!(fixture_response.contains("\"phase\":\"forward\""));
 
         let mut events = TcpStream::connect(server.address()).unwrap();
         events
