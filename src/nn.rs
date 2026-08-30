@@ -152,6 +152,7 @@ pub enum GptError {
     EmptyBatch,
     EmptySequence,
     RaggedBatch,
+    TargetBatchMismatch,
     SequenceTooLong { length: usize, block_size: usize },
 }
 
@@ -169,6 +170,12 @@ impl fmt::Display for GptError {
             Self::EmptyBatch => write!(f, "token batch must not be empty"),
             Self::EmptySequence => write!(f, "token sequences must not be empty"),
             Self::RaggedBatch => write!(f, "all token sequences must have the same length"),
+            Self::TargetBatchMismatch => {
+                write!(
+                    f,
+                    "targets must match the input batch and sequence dimensions"
+                )
+            }
             Self::SequenceTooLong { length, block_size } => {
                 write!(
                     f,
@@ -320,7 +327,7 @@ impl Gpt {
             .collect()
     }
 
-    pub fn forward(&mut self, tokens: &[Vec<usize>]) -> Result<Tensor, GptError> {
+    fn validate_tokens(&self, tokens: &[Vec<usize>]) -> Result<usize, GptError> {
         let Some(first) = tokens.first() else {
             return Err(GptError::EmptyBatch);
         };
@@ -340,28 +347,73 @@ impl Gpt {
                 block_size: self.block_size,
             });
         }
+        Ok(sequence_length)
+    }
 
+    fn forward_sequence(&mut self, tokens: &[usize]) -> Result<TensorId, GptError> {
+        let positions = (0..tokens.len()).collect();
+        let token_values = self
+            .token_embedding
+            .forward(&mut self.tape, tokens.to_vec())?;
+        let position_values = self.position_embedding.forward(&mut self.tape, positions)?;
+        let mut hidden = self.tape.add(token_values, position_values)?;
+        for block in &self.blocks {
+            hidden = block.forward(&mut self.tape, hidden)?;
+        }
+        hidden = self.final_norm.forward(&mut self.tape, hidden)?;
+        Ok(self.output.forward(&mut self.tape, hidden)?)
+    }
+
+    pub fn forward(&mut self, tokens: &[Vec<usize>]) -> Result<Tensor, GptError> {
+        let sequence_length = self.validate_tokens(tokens)?;
         let mut logits = Vec::with_capacity(tokens.len() * sequence_length * self.vocab_size);
-        let positions: Vec<usize> = (0..sequence_length).collect();
         for sequence in tokens {
-            let token_values = self
-                .token_embedding
-                .forward(&mut self.tape, sequence.clone())?;
-            let position_values = self
-                .position_embedding
-                .forward(&mut self.tape, positions.clone())?;
-            let mut hidden = self.tape.add(token_values, position_values)?;
-            for block in &self.blocks {
-                hidden = block.forward(&mut self.tape, hidden)?;
-            }
-            hidden = self.final_norm.forward(&mut self.tape, hidden)?;
-            let output = self.output.forward(&mut self.tape, hidden)?;
+            let output = self.forward_sequence(sequence)?;
             logits.extend_from_slice(self.tape.value(output)?.data());
         }
         Ok(
             Tensor::from_vec(vec![tokens.len(), sequence_length, self.vocab_size], logits)
                 .map_err(TapeError::from)?,
         )
+    }
+
+    pub fn loss(
+        &mut self,
+        tokens: &[Vec<usize>],
+        targets: &[Vec<usize>],
+    ) -> Result<TensorId, GptError> {
+        let sequence_length = self.validate_tokens(tokens)?;
+        if targets.len() != tokens.len()
+            || targets
+                .iter()
+                .any(|sequence| sequence.len() != sequence_length)
+        {
+            return Err(GptError::TargetBatchMismatch);
+        }
+        let mut total = None;
+        for (sequence, target) in tokens.iter().zip(targets) {
+            let logits = self.forward_sequence(sequence)?;
+            let sequence_loss = self.tape.cross_entropy(logits, target.clone())?;
+            total = Some(match total {
+                Some(previous) => self.tape.add(previous, sequence_loss)?,
+                None => sequence_loss,
+            });
+        }
+        Ok(self.tape.scale(
+            total.expect("validated non-empty batch"),
+            1.0 / tokens.len() as f32,
+        )?)
+    }
+
+    pub fn loss_value(&self, loss: TensorId) -> Result<f32, GptError> {
+        Ok(self.tape.value(loss)?.data()[0])
+    }
+
+    pub fn backward(
+        &self,
+        loss: TensorId,
+    ) -> Result<std::collections::HashMap<TensorId, Tensor>, GptError> {
+        Ok(self.tape.backward(loss)?)
     }
 }
 
@@ -433,5 +485,24 @@ mod tests {
             model.forward(&[vec![0; 17]]),
             Err(GptError::SequenceTooLong { .. })
         ));
+    }
+
+    #[test]
+    fn gpt_loss_stays_on_tape_and_reaches_parameters() {
+        let mut model = Gpt::new_with_seed(65, 4, 1, 1, 8, 42).unwrap();
+        let tokens = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]];
+        let targets = vec![vec![2, 3, 4, 5], vec![6, 7, 8, 9]];
+        let loss = model.loss(&tokens, &targets).unwrap();
+        assert!(model.tape.value(loss).unwrap().shape().is_empty());
+        assert!((model.loss_value(loss).unwrap() - 65.0_f32.ln()).abs() < 0.1);
+        let gradients = model.backward(loss).unwrap();
+        let parameters = model.parameters();
+        assert!(parameters.iter().all(|id| gradients.contains_key(id)));
+        assert!(
+            parameters
+                .iter()
+                .flat_map(|id| gradients[id].data())
+                .any(|value| value.abs() > 1e-8)
+        );
     }
 }

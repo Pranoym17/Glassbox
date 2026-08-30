@@ -19,6 +19,7 @@ pub enum OpType {
     LayerNorm,
     Gelu,
     Reshape,
+    CrossEntropy,
 }
 #[derive(Clone, Debug)]
 pub enum SavedContext {
@@ -47,6 +48,10 @@ pub enum SavedContext {
     },
     Reshape {
         input_shape: Vec<usize>,
+    },
+    CrossEntropy {
+        probabilities: Tensor,
+        targets: Vec<usize>,
     },
 }
 #[derive(Clone, Debug)]
@@ -254,6 +259,58 @@ impl Tape {
             output,
         ))
     }
+    pub fn cross_entropy(
+        &mut self,
+        logits: TensorId,
+        targets: Vec<usize>,
+    ) -> Result<TensorId, TapeError> {
+        let values = self.value(logits)?.contiguous();
+        if values.shape().len() != 2 {
+            return Err(TensorError::RankMismatch {
+                expected: 2,
+                actual: values.shape().len(),
+            }
+            .into());
+        }
+        let (rows, columns) = (values.shape()[0], values.shape()[1]);
+        if targets.len() != rows {
+            return Err(TensorError::DataLengthMismatch {
+                expected: rows,
+                actual: targets.len(),
+            }
+            .into());
+        }
+        let mut probabilities = vec![0.0; rows * columns];
+        let mut loss = 0.0;
+        for (row, &target) in targets.iter().enumerate() {
+            if target >= columns {
+                return Err(TensorError::IndexOutOfBounds {
+                    axis: 1,
+                    index: target,
+                    dimension: columns,
+                }
+                .into());
+            }
+            let values = &values.data()[row * columns..(row + 1) * columns];
+            let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = values.iter().map(|value| (value - maximum).exp()).sum();
+            loss += maximum + sum.ln() - values[target];
+            for column in 0..columns {
+                probabilities[row * columns + column] = (values[column] - maximum).exp() / sum;
+            }
+        }
+        let probabilities = Tensor::from_vec(vec![rows, columns], probabilities)?;
+        let output = Tensor::from_vec(vec![], vec![loss / rows as f32])?;
+        Ok(self.append(
+            OpType::CrossEntropy,
+            vec![logits],
+            SavedContext::CrossEntropy {
+                probabilities,
+                targets,
+            },
+            output,
+        ))
+    }
     pub fn backward(&self, loss: TensorId) -> Result<HashMap<TensorId, Tensor>, TapeError> {
         let mut seen = HashSet::new();
         let mut order = vec![];
@@ -367,6 +424,29 @@ impl Tape {
                 }
                 (OpType::Reshape, SavedContext::Reshape { input_shape }) => {
                     self.acc(&mut g, e.inputs[0], up.reshape(input_shape.clone())?)?
+                }
+                (
+                    OpType::CrossEntropy,
+                    SavedContext::CrossEntropy {
+                        probabilities,
+                        targets,
+                    },
+                ) => {
+                    let rows = probabilities.shape()[0];
+                    let columns = probabilities.shape()[1];
+                    let factor = up.data()[0] / rows as f32;
+                    let mut data = probabilities.data().to_vec();
+                    for (row, &target) in targets.iter().enumerate() {
+                        data[row * columns + target] -= 1.0;
+                    }
+                    for value in &mut data {
+                        *value *= factor;
+                    }
+                    self.acc(
+                        &mut g,
+                        e.inputs[0],
+                        Tensor::from_vec(probabilities.shape().to_vec(), data)?,
+                    )?
                 }
                 _ => unreachable!(),
             }
@@ -744,5 +824,33 @@ mod tests {
             .iter()
             .sum()
         });
+    }
+
+    fn cross_entropy_value(logits: Tensor, targets: &[usize]) -> f32 {
+        let mut tape = Tape::new();
+        let logits = tape.leaf(logits);
+        let loss = tape.cross_entropy(logits, targets.to_vec()).unwrap();
+        tape.value(loss).unwrap().data()[0]
+    }
+
+    #[test]
+    fn cross_entropy_backward_matches_finite_differences() {
+        let logits =
+            Tensor::from_vec(vec![2, 4], vec![0.2, -0.4, 0.7, 0.1, 1.1, 0.3, -0.2, 0.8]).unwrap();
+        let targets = vec![2, 0];
+        let mut tape = Tape::new();
+        let logits_id = tape.leaf(logits.clone());
+        let loss = tape.cross_entropy(logits_id, targets.clone()).unwrap();
+        let gradients = tape.backward(loss).unwrap();
+        check_gradient(&gradients[&logits_id], &logits, |value| {
+            cross_entropy_value(value, &targets)
+        });
+    }
+
+    #[test]
+    fn uniform_cross_entropy_is_log_vocabulary_size() {
+        let logits = Tensor::zeros(vec![3, 65]).unwrap();
+        let loss = cross_entropy_value(logits, &[0, 17, 64]);
+        assert!((loss - 65.0_f32.ln()).abs() < 1e-5);
     }
 }
