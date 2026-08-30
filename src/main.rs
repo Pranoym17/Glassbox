@@ -1,8 +1,10 @@
+#[cfg(not(feature = "cpu-only"))]
 use cudarc::{
     driver::{CudaContext, LaunchConfig, PushKernelArg},
     nvrtc::Ptx,
 };
 
+#[cfg(not(feature = "cpu-only"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n: usize = 1_000_003;
     let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
@@ -43,4 +45,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("PASS: cudarc vector_add verified {n} elements.");
     Ok(())
+}
+
+#[cfg(feature = "cpu-only")]
+fn main() {
+    println!("Glassbox was built without CUDA support.");
 }

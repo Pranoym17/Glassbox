@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 pub mod autograd;
 pub mod data;
+#[cfg(not(feature = "cpu-only"))]
 pub mod gpu;
 pub mod nn;
 pub mod optim;
@@ -308,6 +309,7 @@ impl Tensor {
         Self::from_vec(target.to_vec(), out)
     }
 
+    #[cfg(not(feature = "cpu-only"))]
     pub(crate) fn broadcast_shape(
         left: &[usize],
         right: &[usize],

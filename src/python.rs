@@ -345,6 +345,7 @@ pub struct PyGpt {
 impl PyGpt {
     #[new]
     #[pyo3(signature = (vocab_size, block_size, n_layer, n_head, n_embd, seed = 1337, learning_rate = 3e-4, optimizer = "adam", weight_decay = 0.0))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         vocab_size: usize,
         block_size: usize,
