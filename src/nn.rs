@@ -432,6 +432,49 @@ impl Gpt {
         result
     }
 
+    pub fn generate(
+        &mut self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_k: Option<usize>,
+        seed: u64,
+    ) -> Result<Vec<usize>, GptError> {
+        if prompt.is_empty() {
+            return Err(GptError::EmptySequence);
+        }
+        if prompt.iter().any(|&token| token >= self.vocab_size) {
+            return Err(GptError::InvalidConfiguration(
+                "prompt token is outside the vocabulary",
+            ));
+        }
+        if !temperature.is_finite() || temperature <= 0.0 {
+            return Err(GptError::InvalidConfiguration(
+                "temperature must be finite and positive",
+            ));
+        }
+        if top_k == Some(0) {
+            return Err(GptError::InvalidConfiguration("top_k must be positive"));
+        }
+        let mut tokens = prompt.to_vec();
+        let mut random = Initializer::new(seed);
+        for _ in 0..max_new_tokens {
+            let start = tokens.len().saturating_sub(self.block_size);
+            let context = tokens[start..].to_vec();
+            let sequence_length = context.len();
+            let logits = self.forward(&[context])?;
+            let offset = (sequence_length - 1) * self.vocab_size;
+            let next = sample_token(
+                &logits.data()[offset..offset + self.vocab_size],
+                temperature,
+                top_k,
+                &mut random,
+            );
+            tokens.push(next);
+        }
+        Ok(tokens)
+    }
+
     pub fn loss(
         &mut self,
         tokens: &[Vec<usize>],
@@ -537,6 +580,35 @@ impl Gpt {
         Ok(())
     }
 }
+
+fn sample_token(
+    logits: &[f32],
+    temperature: f32,
+    top_k: Option<usize>,
+    random: &mut Initializer,
+) -> usize {
+    let mut candidates: Vec<usize> = (0..logits.len()).collect();
+    candidates.sort_by(|&left, &right| {
+        logits[right]
+            .total_cmp(&logits[left])
+            .then_with(|| left.cmp(&right))
+    });
+    candidates.truncate(top_k.unwrap_or(logits.len()).min(logits.len()));
+    let maximum = logits[candidates[0]] / temperature;
+    let weights: Vec<f32> = candidates
+        .iter()
+        .map(|&index| (logits[index] / temperature - maximum).exp())
+        .collect();
+    let mut sample = random.uniform() * weights.iter().sum::<f32>();
+    for (&candidate, weight) in candidates.iter().zip(weights) {
+        sample -= weight;
+        if sample <= 0.0 {
+            return candidate;
+        }
+    }
+    *candidates.last().expect("validated non-empty vocabulary")
+}
+
 fn write_u64(file: &mut File, value: u64) -> Result<(), std::io::Error> {
     file.write_all(&value.to_le_bytes())
 }
@@ -725,5 +797,27 @@ mod tests {
                 .iter()
                 .all(|event| event.contains("\"phase\":\"backward\""))
         );
+    }
+
+    #[test]
+    fn generation_from_checkpoint_is_deterministic() {
+        let prompt = vec![1, 2, 3];
+        let path =
+            std::env::temp_dir().join(format!("glassbox-generation-{}.gbx", std::process::id()));
+        let source = Gpt::new_with_seed(17, 4, 1, 1, 8, 11).unwrap();
+        source.save_checkpoint(&path).unwrap();
+
+        let mut first = Gpt::new_with_seed(17, 4, 1, 1, 8, 99).unwrap();
+        first.load_checkpoint(&path).unwrap();
+        let first_tokens = first.generate(&prompt, 8, 0.8, Some(5), 42).unwrap();
+
+        let mut second = Gpt::new_with_seed(17, 4, 1, 1, 8, 7).unwrap();
+        second.load_checkpoint(&path).unwrap();
+        let second_tokens = second.generate(&prompt, 8, 0.8, Some(5), 42).unwrap();
+        assert_eq!(first_tokens, second_tokens);
+        assert_eq!(&first_tokens[..prompt.len()], &prompt);
+        assert_eq!(first_tokens.len(), prompt.len() + 8);
+        assert!(first_tokens.iter().all(|&token| token < 17));
+        std::fs::remove_file(path).unwrap();
     }
 }

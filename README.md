@@ -33,6 +33,8 @@ The script reports step-0 loss against `ln(vocab_size)`, validation loss, and ev
 
 Choose plain SGD with `--optimizer sgd`. For Adam, `--weight-decay` applies decoupled AdamW weight decay.
 
+After saving the checkpoint, the training example loads it into a fresh model and prints an autoregressive sample. Use `--prompt`, `--generate-tokens`, `--temperature`, `--top-k`, and `--sample-seed` to control generation.
+
 ## Continuous integration
 
 The workflow runs formatting, linting, all CPU/autograd tests, and the Python smoke test on pushes and pull requests to main. It uses the cpu-only feature because free hosted runners do not provide a CUDA GPU. CUDA kernel tests remain part of the normal local cargo test run on an NVIDIA machine.

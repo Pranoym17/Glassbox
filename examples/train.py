@@ -24,6 +24,11 @@ def main():
     parser.add_argument("--visualizer", action="store_true")
     parser.add_argument("--visualizer-port", type=int, default=8080)
     parser.add_argument("--trace-interval", type=int, default=50)
+    parser.add_argument("--generate-tokens", type=int, default=200)
+    parser.add_argument("--prompt", default="\n")
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--sample-seed", type=int, default=1337)
     args = parser.parse_args()
 
     dataset = gb.data.CharDataset(
@@ -90,6 +95,26 @@ def main():
     model.save_checkpoint(str(checkpoint))
     print(f"loss_curve={output}")
     print(f"checkpoint={checkpoint}")
+
+    restored = gb.nn.GPT(
+        dataset.vocab_size,
+        args.block_size,
+        args.n_layer,
+        1,
+        args.n_embd,
+        seed=args.seed,
+    )
+    restored.load_checkpoint(str(checkpoint))
+    prompt = dataset.encode(args.prompt)
+    generated = restored.generate(
+        prompt,
+        args.generate_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        seed=args.sample_seed,
+    )
+    print("sample:")
+    print(dataset.decode(generated))
 
     if args.visualizer:
         print(f"visualizer_dropped_events={model.dropped_events()}")

@@ -395,6 +395,20 @@ impl PyGpt {
         })
     }
 
+    #[pyo3(signature = (prompt, max_new_tokens, temperature = 1.0, top_k = None, seed = 1337))]
+    fn generate(
+        &mut self,
+        prompt: Vec<usize>,
+        max_new_tokens: usize,
+        temperature: f32,
+        top_k: Option<usize>,
+        seed: u64,
+    ) -> PyResult<Vec<usize>> {
+        self.model
+            .generate(&prompt, max_new_tokens, temperature, top_k, seed)
+            .map_err(value_error)
+    }
+
     #[pyo3(signature = (tokens, targets, maximum_norm = 1.0))]
     fn train_step(
         &mut self,
@@ -512,6 +526,14 @@ impl PyCharDataset {
     #[getter]
     fn vocab_size(&self) -> usize {
         self.dataset.vocab_size()
+    }
+
+    fn encode(&self, text: &str) -> PyResult<Vec<usize>> {
+        self.dataset.encode(text).map_err(value_error)
+    }
+
+    fn decode(&self, tokens: Vec<usize>) -> PyResult<String> {
+        self.dataset.decode(&tokens).map_err(value_error)
     }
 
     fn batch(&mut self, split: &str, batch_size: usize) -> PyResult<Batch> {

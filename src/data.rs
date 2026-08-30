@@ -15,6 +15,8 @@ pub enum DataError {
     Io(std::io::Error),
     TextTooShort { length: usize, block_size: usize },
     EmptyBatch,
+    UnknownCharacter(char),
+    InvalidToken(usize),
 }
 
 impl fmt::Display for DataError {
@@ -26,6 +28,10 @@ impl fmt::Display for DataError {
                 "text length {length} is too short for block size {block_size} and a validation split"
             ),
             Self::EmptyBatch => write!(f, "batch size must be positive"),
+            Self::UnknownCharacter(character) => {
+                write!(f, "character {character:?} is not in the vocabulary")
+            }
+            Self::InvalidToken(token) => write!(f, "token {token} is outside the vocabulary"),
         }
     }
 }
@@ -123,6 +129,28 @@ impl CharDataset {
         self.vocabulary.len()
     }
 
+    pub fn encode(&self, text: &str) -> Result<Vec<usize>, DataError> {
+        text.chars()
+            .map(|character| {
+                self.vocabulary
+                    .binary_search(&character)
+                    .map_err(|_| DataError::UnknownCharacter(character))
+            })
+            .collect()
+    }
+
+    pub fn decode(&self, tokens: &[usize]) -> Result<String, DataError> {
+        tokens
+            .iter()
+            .map(|&token| {
+                self.vocabulary
+                    .get(token)
+                    .copied()
+                    .ok_or(DataError::InvalidToken(token))
+            })
+            .collect()
+    }
+
     pub fn batch(&mut self, split: Split, batch_size: usize) -> Result<Batch, DataError> {
         if batch_size == 0 {
             return Err(DataError::EmptyBatch);
@@ -191,5 +219,16 @@ mod tests {
         assert_eq!(inputs.len(), 8);
         assert!(inputs.iter().all(|sequence| sequence.len() == 16));
         assert!(targets.iter().all(|sequence| sequence.len() == 16));
+    }
+
+    #[test]
+    fn text_encoding_round_trips() {
+        let dataset = CharDataset::from_text(&text(), 4, 42).unwrap();
+        let encoded = dataset.encode("To be\n").unwrap();
+        assert_eq!(dataset.decode(&encoded).unwrap(), "To be\n");
+        assert!(matches!(
+            dataset.encode("~"),
+            Err(DataError::UnknownCharacter('~'))
+        ));
     }
 }

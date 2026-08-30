@@ -78,6 +78,14 @@ restored = gb.nn.GPT(65, 4, 1, 1, 8, seed=7)
 restored.load_checkpoint(checkpoint.name)
 actual = restored.forward(inputs)
 assert actual.data == expected.data
+prompt = dataset.encode("\n")
+sample = restored.generate(prompt, 8, temperature=0.8, top_k=5, seed=9)
+assert sample[: len(prompt)] == prompt
+assert len(sample) == len(prompt) + 8
+assert dataset.decode(sample).startswith("\n")
+reloaded = gb.nn.GPT(65, 4, 1, 1, 8, seed=99)
+reloaded.load_checkpoint(checkpoint.name)
+assert reloaded.generate(prompt, 8, temperature=0.8, top_k=5, seed=9) == sample
 os.remove(checkpoint.name)
 
 try:
