@@ -1,6 +1,7 @@
 use std::fmt;
 
 pub mod autograd;
+pub mod data;
 pub mod gpu;
 pub mod nn;
 pub mod optim;
