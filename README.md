@@ -40,6 +40,9 @@ python examples/train.py --steps 100 --visualizer --trace-interval 10
 ```
 
 The Python `GPT.enable_visualizer(port=8080, trace_interval=50, capacity=8192)` method returns the page URL. `GPT.dropped_events()` reports queue overflow, and `GPT.disable_visualizer()` removes the emitter.
+
 The renderer represents each tensor once and draws one operation-labeled edge for every distinct input-to-output pair. It assigns horizontal layers by longest-path topological depth and spreads nodes vertically within each layer, avoiding a force-directed layout. Batched traces are reduced in the browser to the first sequence through its cross-entropy node; shared parameter leaves remain visible, and the filter can be disabled.
 
 Backward edges point from outputs back to inputs in a separate orange hue. Their width and intensity use a logarithmic scale whose legend shows the actual minimum and maximum gradient norms. Fixture replay advances by event index rather than recorded wall-clock time. The page works from the built-in server, or can be double-clicked and given either JSON fixture through the file picker.
+
+Live mode keeps the five newest complete steps and exposes a selector for older buffered steps. Selecting a different step rebuilds the graph from that step alone because tape tensor IDs are reused. After an SSE reconnect, the first observed step is discarded conservatively so a stream that resumed mid-step cannot be rendered as complete.

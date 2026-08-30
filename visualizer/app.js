@@ -168,12 +168,69 @@ export function graphAssertions(events, graph) {
   }
   return true;
 }
+export class LiveStepBuffer {
+  constructor(limit = 5) {
+    this.limit = limit;
+    this.steps = [];
+    this.currentStep = null;
+    this.current = [];
+    this.discardFirst = false;
+    this.discardStep = null;
+  }
+
+  reconnect() {
+    this.currentStep = null;
+    this.current = [];
+    this.discardFirst = true;
+    this.discardStep = null;
+  }
+
+  push(event) {
+    if (this.discardFirst) {
+      this.discardFirst = false;
+      this.discardStep = event.step;
+      return null;
+    }
+    if (this.discardStep !== null) {
+      if (event.step === this.discardStep) return null;
+      this.discardStep = null;
+    }
+
+    let completed = null;
+    if (this.currentStep !== null && event.step !== this.currentStep) {
+      completed = this.complete();
+    }
+    if (this.currentStep === null) this.currentStep = event.step;
+    this.current.push(event);
+    return completed;
+  }
+
+  complete() {
+    if (!this.current.length) return null;
+    const events = this.current;
+    this.current = [];
+    this.currentStep = null;
+    try {
+      validateEvents(events);
+    } catch (_) {
+      return null;
+    }
+    this.steps = this.steps.filter((step) => step[0].step !== events[0].step);
+    this.steps.push(events);
+    if (this.steps.length > this.limit) {
+      this.steps.splice(0, this.steps.length - this.limit);
+    }
+    return events;
+  }
+}
 
 function startBrowser() {
   const d3 = globalThis.d3;
   const elements = Object.fromEntries(
     [
       "banner",
+      "buffered",
+      "connect-live",
       "connection",
       "edge-count",
       "empty",
@@ -193,6 +250,7 @@ function startBrowser() {
       "source",
       "speed",
       "step",
+      "step-select",
     ].map((id) => [id, document.getElementById(id)]),
   );
   const state = {
@@ -207,6 +265,10 @@ function startBrowser() {
     backwardLayer: null,
     widthScale: null,
     colorScale: null,
+    live: new LiveStepBuffer(5),
+    liveSource: null,
+    liveTimer: null,
+    followLive: true,
   };
   const nodeWidth = 142;
 
@@ -460,19 +522,92 @@ function startBrowser() {
     state.timer = setTimeout(tick, 1000 / Number(elements.speed.value));
     renderFrame();
   }
+  function commitLive(events) {
+    const previous = elements["step-select"].value;
+    elements["step-select"].replaceChildren(
+      ...state.live.steps.map((candidate) =>
+        new Option(`step ${candidate[0].step}`, String(candidate[0].step))
+      ),
+    );
+    elements.buffered.textContent =
+      `${state.live.steps.length} / ${state.live.limit}`;
+    const available = state.live.steps.some((candidate) =>
+      String(candidate[0].step) === previous
+    );
+    if (state.followLive || !available) {
+      state.followLive = true;
+      elements["step-select"].value = String(events[0].step);
+      load(events, `live step ${events[0].step}`);
+    } else {
+      elements["step-select"].value = previous;
+    }
+  }
+
+  function finishLive() {
+    state.liveTimer = null;
+    const events = state.live.complete();
+    if (events) commitLive(events);
+  }
+
+  function connectLive() {
+    if (location.protocol === "file:") {
+      showError("Live SSE requires the Glassbox HTTP server.");
+      return;
+    }
+    if (state.liveSource) {
+      state.liveSource.close();
+      state.live.reconnect();
+    }
+    clearTimeout(state.liveTimer);
+    state.liveTimer = null;
+    elements.connection.textContent = "connecting";
+    const source = new EventSource("/events");
+    state.liveSource = source;
+    source.onopen = () => {
+      elements.connection.textContent = "live";
+      elements["connect-live"].textContent = "reconnect";
+    };
+    source.onerror = () => {
+      elements.connection.textContent = "reconnecting - partial step discarded";
+      state.live.reconnect();
+      clearTimeout(state.liveTimer);
+      state.liveTimer = null;
+    };
+    source.onmessage = (message) => {
+      try {
+        const event = JSON.parse(message.data);
+        const completed = state.live.push(event);
+        if (completed) commitLive(completed);
+        elements.connection.textContent = `receiving step ${event.step}`;
+        clearTimeout(state.liveTimer);
+        if (event.phase === "backward") {
+          state.liveTimer = setTimeout(finishLive, 500);
+        }
+      } catch (error) {
+        showError(error);
+      }
+    };
+  }
 
   if (!d3) {
     showError("D3 v7 failed to load; check the CDN connection.");
     return;
   }
-  elements["load-tiny"].onclick = () =>
+  elements["load-tiny"].onclick = () => {
+    state.followLive = false;
     loadFixture("fixtures/tiny_step.json", "tiny fixture");
-  elements["load-full"].onclick = () =>
+  };
+  elements["load-full"].onclick = () => {
+    state.followLive = false;
     loadFixture("fixtures/step.json", "full fixture");
+  };
   elements.file.onchange = async (event) => {
     try {
       const file = event.target.files[0];
-      if (file) load(JSON.parse(await file.text()), file.name);
+      if (file) {
+        state.followLive = false;
+        load(JSON.parse(await file.text()), file.name);
+      }
     } catch (error) {
       showError(error);
     }
@@ -484,6 +619,20 @@ function startBrowser() {
       } catch (error) {
         showError(error);
       }
+    }
+  };
+  elements["connect-live"].onclick = () => {
+    state.followLive = true;
+    connectLive();
+  };
+  elements["step-select"].onchange = () => {
+    const step = Number(elements["step-select"].value);
+    const events = state.live.steps.find((candidate) =>
+      candidate[0].step === step
+    );
+    if (events) {
+      state.followLive = false;
+      load(events, `live step ${step}`);
     }
   };
   elements.play.onclick = play;
@@ -507,6 +656,7 @@ function startBrowser() {
     elements.connection.textContent = "local file - choose JSON";
   } else {
     loadFixture("fixtures/tiny_step.json", "tiny fixture");
+    connectLive();
   }
 }
 

@@ -61,6 +61,15 @@
         <div class="row"><label><input id="first-sequence" type="checkbox" checked> first sequence only</label></div>
       </div>
       <div class="group">
+        <h2>Live SSE</h2>
+        <div class="row">
+          <button id="connect-live">connect</button>
+          <select id="step-select" aria-label="buffered step">
+            <option value="">no complete steps</option>
+          </select>
+        </div>
+      </div>
+      <div class="group">
         <h2>Replay</h2>
         <div class="row">
           <button id="previous" aria-label="previous event">&lt;</button>
@@ -83,6 +92,7 @@
           <span>event</span><output id="event-count">0 / 0</output>
           <span>nodes</span><output id="node-count">0</output>
           <span>edges</span><output id="edge-count">0</output>
+          <span>buffered</span><output id="buffered">0 / 5</output>
         </div>
       </div>
       <div class="group legend">
