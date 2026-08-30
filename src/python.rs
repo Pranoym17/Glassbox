@@ -1,9 +1,11 @@
 use crate::Tensor;
 use crate::autograd::{Tape, TensorId};
+use crate::data::{Batch, CharDataset, Split};
 use crate::nn::{
     Embedding as RustEmbedding, Gpt, Initializer, LayerNorm as RustLayerNorm, Linear as RustLinear,
     Module as RustModule,
 };
+use crate::optim::{Adam, clip_gradients, gradient_norms};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -215,12 +217,13 @@ impl PyEmbedding {
 #[pyclass(name = "GPT", extends = PyModuleBase, module = "glassbox.nn")]
 pub struct PyGpt {
     model: Gpt,
+    optimizer: Adam,
 }
 
 #[pymethods]
 impl PyGpt {
     #[new]
-    #[pyo3(signature = (vocab_size, block_size, n_layer, n_head, n_embd, seed = 1337))]
+    #[pyo3(signature = (vocab_size, block_size, n_layer, n_head, n_embd, seed = 1337, learning_rate = 3e-4))]
     fn new(
         vocab_size: usize,
         block_size: usize,
@@ -228,16 +231,58 @@ impl PyGpt {
         n_head: usize,
         n_embd: usize,
         seed: u64,
+        learning_rate: f32,
     ) -> PyResult<PyClassInitializer<Self>> {
         let model = Gpt::new_with_seed(vocab_size, block_size, n_layer, n_head, n_embd, seed)
             .map_err(value_error)?;
-        Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self { model }))
+        Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self {
+            model,
+            optimizer: Adam::new(learning_rate, 0.9, 0.999, 1e-8),
+        }))
     }
 
     fn forward(&mut self, tokens: Vec<Vec<usize>>) -> PyResult<PyTensor> {
         Ok(PyTensor {
             inner: self.model.forward(&tokens).map_err(value_error)?,
         })
+    }
+
+    #[pyo3(signature = (tokens, targets, maximum_norm = 1.0))]
+    fn train_step(
+        &mut self,
+        tokens: Vec<Vec<usize>>,
+        targets: Vec<Vec<usize>>,
+        maximum_norm: f32,
+    ) -> PyResult<(f32, Vec<f32>)> {
+        self.model.reset_tape().map_err(value_error)?;
+        let loss = self.model.loss(&tokens, &targets).map_err(value_error)?;
+        let value = self.model.loss_value(loss).map_err(value_error)?;
+        let mut gradients = self.model.backward(loss).map_err(value_error)?;
+        let parameters = self.model.parameters();
+        let norms = gradient_norms(&parameters, &gradients);
+        clip_gradients(&parameters, &mut gradients, maximum_norm).map_err(value_error)?;
+        self.optimizer
+            .step(self.model.tape_mut(), &parameters, &gradients)
+            .map_err(value_error)?;
+        self.optimizer.zero_grad(&mut gradients);
+        self.model.reset_tape().map_err(value_error)?;
+        Ok((value, norms))
+    }
+
+    fn evaluate(&mut self, tokens: Vec<Vec<usize>>, targets: Vec<Vec<usize>>) -> PyResult<f32> {
+        self.model.reset_tape().map_err(value_error)?;
+        let loss = self.model.loss(&tokens, &targets).map_err(value_error)?;
+        let value = self.model.loss_value(loss).map_err(value_error)?;
+        self.model.reset_tape().map_err(value_error)?;
+        Ok(value)
+    }
+
+    fn save_checkpoint(&self, path: &str) -> PyResult<()> {
+        self.model.save_checkpoint(path).map_err(value_error)
+    }
+
+    fn load_checkpoint(&mut self, path: &str) -> PyResult<()> {
+        self.model.load_checkpoint(path).map_err(value_error)
     }
 
     fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -251,6 +296,49 @@ impl PyGpt {
     }
 }
 
+#[pyclass(name = "CharDataset", module = "glassbox.data")]
+pub struct PyCharDataset {
+    dataset: CharDataset,
+}
+
+#[pymethods]
+impl PyCharDataset {
+    #[new]
+    #[pyo3(signature = (path, block_size, seed = 1337))]
+    fn new(path: &str, block_size: usize, seed: u64) -> PyResult<Self> {
+        Ok(Self {
+            dataset: CharDataset::from_file(path, block_size, seed).map_err(value_error)?,
+        })
+    }
+
+    #[getter]
+    fn vocabulary(&self) -> Vec<String> {
+        self.dataset
+            .vocabulary()
+            .iter()
+            .map(char::to_string)
+            .collect()
+    }
+
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.dataset.vocab_size()
+    }
+
+    fn batch(&mut self, split: &str, batch_size: usize) -> PyResult<Batch> {
+        let split = match split {
+            "train" => Split::Train,
+            "validation" | "val" => Split::Validation,
+            value => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown split {value:?}; use 'train' or 'validation'"
+                )));
+            }
+        };
+        self.dataset.batch(split, batch_size).map_err(value_error)
+    }
+}
+
 #[pymodule]
 pub fn glassbox(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTensor>()?;
@@ -261,6 +349,9 @@ pub fn glassbox(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     nn.add_class::<PyEmbedding>()?;
     nn.add_class::<PyGpt>()?;
     module.add_submodule(&nn)?;
+    let data = PyModule::new(py, "glassbox.data")?;
+    data.add_class::<PyCharDataset>()?;
+    module.add_submodule(&data)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

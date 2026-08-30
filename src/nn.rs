@@ -2,6 +2,9 @@ use crate::Tensor;
 use crate::autograd::{Tape, TapeError, TensorId};
 use crate::transformer::causal_attention_tape;
 use std::fmt;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
 
 pub trait Module {
     type Input;
@@ -154,6 +157,8 @@ pub enum GptError {
     RaggedBatch,
     TargetBatchMismatch,
     SequenceTooLong { length: usize, block_size: usize },
+    Io(std::io::Error),
+    InvalidCheckpoint(String),
 }
 
 impl fmt::Display for GptError {
@@ -182,6 +187,8 @@ impl fmt::Display for GptError {
                     "sequence length {length} exceeds block size {block_size}"
                 )
             }
+            Self::Io(error) => write!(f, "{error}"),
+            Self::InvalidCheckpoint(message) => write!(f, "invalid checkpoint: {message}"),
         }
     }
 }
@@ -191,6 +198,11 @@ impl std::error::Error for GptError {}
 impl From<TapeError> for GptError {
     fn from(error: TapeError) -> Self {
         Self::Tape(error)
+    }
+}
+impl From<std::io::Error> for GptError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
@@ -429,6 +441,81 @@ impl Gpt {
     ) -> Result<std::collections::HashMap<TensorId, Tensor>, GptError> {
         Ok(self.tape.backward(loss)?)
     }
+
+    pub(crate) fn tape_mut(&mut self) -> &mut Tape {
+        &mut self.tape
+    }
+
+    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<(), GptError> {
+        let mut file = File::create(path)?;
+        file.write_all(b"GBX1")?;
+        let values = self.parameter_values()?;
+        write_u64(&mut file, values.len() as u64)?;
+        for tensor in values {
+            write_u64(&mut file, tensor.shape().len() as u64)?;
+            for &dimension in tensor.shape() {
+                write_u64(&mut file, dimension as u64)?;
+            }
+            write_u64(&mut file, tensor.data().len() as u64)?;
+            for &value in tensor.data() {
+                file.write_all(&value.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_checkpoint(&mut self, path: impl AsRef<Path>) -> Result<(), GptError> {
+        self.reset_tape()?;
+        let mut file = File::open(path)?;
+        let mut magic = [0_u8; 4];
+        file.read_exact(&mut magic)?;
+        if &magic != b"GBX1" {
+            return Err(GptError::InvalidCheckpoint("bad magic".to_string()));
+        }
+        let parameters = self.parameters();
+        let count = read_u64(&mut file)? as usize;
+        if count != parameters.len() {
+            return Err(GptError::InvalidCheckpoint(format!(
+                "expected {} parameters, found {count}",
+                parameters.len()
+            )));
+        }
+        let mut tensors = Vec::with_capacity(count);
+        for &id in &parameters {
+            let rank = read_u64(&mut file)? as usize;
+            let mut shape = Vec::with_capacity(rank);
+            for _ in 0..rank {
+                shape.push(read_u64(&mut file)? as usize);
+            }
+            let length = read_u64(&mut file)? as usize;
+            let mut data = Vec::with_capacity(length);
+            for _ in 0..length {
+                let mut bytes = [0_u8; 4];
+                file.read_exact(&mut bytes)?;
+                data.push(f32::from_le_bytes(bytes));
+            }
+            let expected = self.tape.value(id)?.shape();
+            if shape != expected {
+                return Err(GptError::InvalidCheckpoint(format!(
+                    "parameter {id} has shape {shape:?}, expected {expected:?}"
+                )));
+            }
+            tensors.push(Tensor::from_vec(shape, data).map_err(TapeError::from)?);
+        }
+        for (id, tensor) in parameters.into_iter().zip(tensors) {
+            self.tape.overwrite_leaf(id, tensor)?;
+        }
+        Ok(())
+    }
+}
+fn write_u64(file: &mut File, value: u64) -> Result<(), std::io::Error> {
+    file.write_all(&value.to_le_bytes())
+}
+
+fn read_u64(file: &mut File) -> Result<u64, std::io::Error> {
+    let mut bytes = [0_u8; 8];
+    file.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -536,5 +623,21 @@ mod tests {
             assert_eq!(model.parameters(), parameters);
             assert_eq!(model.parameter_values().unwrap(), values);
         }
+    }
+
+    #[test]
+    fn checkpoint_round_trip_preserves_logits() {
+        let tokens = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]];
+        let mut source = Gpt::new_with_seed(17, 4, 1, 1, 8, 11).unwrap();
+        let expected = source.forward(&tokens).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("glassbox-checkpoint-{}.bin", std::process::id()));
+        source.save_checkpoint(&path).unwrap();
+
+        let mut loaded = Gpt::new_with_seed(17, 4, 1, 1, 8, 99).unwrap();
+        loaded.load_checkpoint(&path).unwrap();
+        let actual = loaded.forward(&tokens).unwrap();
+        assert_eq!(actual, expected);
+        std::fs::remove_file(path).unwrap();
     }
 }
