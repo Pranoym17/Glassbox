@@ -103,6 +103,7 @@ extern "C" __global__ void softmax_rows(
         __syncthreads();
     }
     const float maximum = shared[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (unsigned long long column = thread; column < columns; column += blockDim.x) {
@@ -140,6 +141,7 @@ extern "C" __global__ void layer_norm_rows(
         __syncthreads();
     }
     const float mean = shared[0] / static_cast<float>(columns);
+    __syncthreads();
 
     float local_variance = 0.0f;
     for (unsigned long long column = thread; column < columns; column += blockDim.x) {
