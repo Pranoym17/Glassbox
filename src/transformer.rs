@@ -10,7 +10,8 @@ fn dims(x: &Tensor) -> Result<(usize, usize), TensorError> {
     Ok((x.shape()[0], x.shape()[1]))
 }
 pub fn softmax(x: &Tensor) -> Result<Tensor, TensorError> {
-    let (r, c) = dims(x)?;
+    let x = x.contiguous();
+    let (r, c) = dims(&x)?;
     let mut o = vec![0.; r * c];
     for i in 0..r {
         let row = &x.data()[i * c..(i + 1) * c];
@@ -82,6 +83,16 @@ mod tests {
             close(dx.data()[k], (fp - fm) / (2. * e))
         }
     }
+
+    #[test]
+    fn softmax_materializes_non_contiguous_input() {
+        let base = Tensor::from_vec(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let view = base.permute(&[1, 0]).unwrap();
+        assert!(!view.is_contiguous());
+        let expected = softmax(&view.contiguous()).unwrap();
+        let actual = softmax(&view).unwrap();
+        assert!(actual.is_close(&expected, 1e-6, 1e-6).unwrap());
+    }
 }
 #[derive(Clone, Debug)]
 pub struct LayerNormContext {
@@ -95,7 +106,8 @@ pub fn layer_norm(
     beta: &Tensor,
     eps: f32,
 ) -> Result<(Tensor, LayerNormContext), TensorError> {
-    let (r, c) = dims(x)?;
+    let x = x.contiguous();
+    let (r, c) = dims(&x)?;
     if gamma.shape() != [c] || beta.shape() != [c] {
         return Err(TensorError::IncompatibleShapes {
             left: gamma.shape().to_vec(),
@@ -225,6 +237,21 @@ mod layer_tests {
             let numerical = (evaluate(plus) - evaluate(minus)) / (2.0 * e);
             assert!((db.data()[k] - numerical).abs() < 5e-3);
         }
+    }
+
+    #[test]
+    fn layer_norm_materializes_non_contiguous_input() {
+        let base = Tensor::from_vec(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let view = base.permute(&[1, 0]).unwrap();
+        let gamma = Tensor::from_vec(vec![3], vec![1.0, 0.7, 1.2]).unwrap();
+        let beta = Tensor::from_vec(vec![3], vec![0.1, 0.2, -0.1]).unwrap();
+        assert!(!view.is_contiguous());
+        let (expected, expected_context) =
+            layer_norm(&view.contiguous(), &gamma, &beta, 1e-5).unwrap();
+        let (actual, actual_context) = layer_norm(&view, &gamma, &beta, 1e-5).unwrap();
+        assert!(actual.is_close(&expected, 1e-6, 1e-6).unwrap());
+        assert_eq!(actual_context.mean, expected_context.mean);
+        assert_eq!(actual_context.variance, expected_context.variance);
     }
 }
 pub fn causal_attention_tape(
