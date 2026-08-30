@@ -11,6 +11,10 @@ pub enum OpType {
     Leaf,
     Add,
     Mul,
+    Sub,
+    Div,
+    Exp,
+    Log,
     MatMul,
     Transpose,
     Scale,
@@ -31,6 +35,10 @@ impl OpType {
             Self::Leaf => "leaf",
             Self::Add => "add",
             Self::Mul => "mul",
+            Self::Sub => "sub",
+            Self::Div => "div",
+            Self::Exp => "exp",
+            Self::Log => "log",
             Self::MatMul => "matmul",
             Self::Transpose => "transpose",
             Self::Scale => "scale",
@@ -53,6 +61,10 @@ pub enum SavedContext {
     Binary {
         left: Tensor,
         right: Tensor,
+    },
+    Unary {
+        input: Tensor,
+        output: Tensor,
     },
     Scale {
         factor: f32,
@@ -224,6 +236,52 @@ impl Tape {
             vec![l, r],
             SavedContext::Binary { left: a, right: b },
             out,
+        ))
+    }
+    pub fn sub(&mut self, l: TensorId, r: TensorId) -> Result<TensorId, TapeError> {
+        let (left, right) = (self.value(l)?.clone(), self.value(r)?.clone());
+        let output = left.sub(&right)?;
+        Ok(self.append(
+            OpType::Sub,
+            vec![l, r],
+            SavedContext::Binary { left, right },
+            output,
+        ))
+    }
+    pub fn div(&mut self, l: TensorId, r: TensorId) -> Result<TensorId, TapeError> {
+        let (left, right) = (self.value(l)?.clone(), self.value(r)?.clone());
+        let output = left.div(&right)?;
+        Ok(self.append(
+            OpType::Div,
+            vec![l, r],
+            SavedContext::Binary { left, right },
+            output,
+        ))
+    }
+    pub fn exp(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
+        let value = self.value(input)?.clone();
+        let output = value.exp()?;
+        Ok(self.append(
+            OpType::Exp,
+            vec![input],
+            SavedContext::Unary {
+                input: value,
+                output: output.clone(),
+            },
+            output,
+        ))
+    }
+    pub fn log(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
+        let value = self.value(input)?.clone();
+        let output = value.log()?;
+        Ok(self.append(
+            OpType::Log,
+            vec![input],
+            SavedContext::Unary {
+                input: value,
+                output: output.clone(),
+            },
+            output,
         ))
     }
     pub fn matmul(&mut self, l: TensorId, r: TensorId) -> Result<TensorId, TapeError> {
@@ -484,6 +542,43 @@ impl Tape {
                         up.mul(left)?
                             .sum_to_shape(self.value(e.inputs[1])?.shape())?,
                     )?
+                }
+                (OpType::Sub, _) => {
+                    self.acc(
+                        &mut g,
+                        e.inputs[0],
+                        up.sum_to_shape(self.value(e.inputs[0])?.shape())?,
+                    )?;
+                    self.acc(
+                        &mut g,
+                        e.inputs[1],
+                        up.mul(&Tensor::from_vec(vec![], vec![-1.0])?)?
+                            .sum_to_shape(self.value(e.inputs[1])?.shape())?,
+                    )?
+                }
+                (OpType::Div, SavedContext::Binary { left, right }) => {
+                    self.acc(
+                        &mut g,
+                        e.inputs[0],
+                        up.div(right)?
+                            .sum_to_shape(self.value(e.inputs[0])?.shape())?,
+                    )?;
+                    let denominator = right.mul(right)?;
+                    let negative = Tensor::from_vec(vec![], vec![-1.0])?;
+                    self.acc(
+                        &mut g,
+                        e.inputs[1],
+                        up.mul(left)?
+                            .div(&denominator)?
+                            .mul(&negative)?
+                            .sum_to_shape(self.value(e.inputs[1])?.shape())?,
+                    )?
+                }
+                (OpType::Exp, SavedContext::Unary { output, .. }) => {
+                    self.acc(&mut g, e.inputs[0], up.mul(output)?)?
+                }
+                (OpType::Log, SavedContext::Unary { input, .. }) => {
+                    self.acc(&mut g, e.inputs[0], up.div(input)?)?
                 }
                 (OpType::MatMul, SavedContext::Binary { left, right }) => {
                     let rt = right.permute(&[1, 0])?;
@@ -836,6 +931,64 @@ mod tests {
 
         check_gradient(&gradients[&input_id], &input, |value| {
             masked_softmax_objective(&value, &weights)
+        });
+    }
+
+    #[test]
+    fn sub_backward_matches_finite_differences_with_broadcasting() {
+        let left = Tensor::from_vec(vec![2, 2], vec![0.4, -0.7, 1.3, 0.2]).unwrap();
+        let right = Tensor::from_vec(vec![2], vec![0.6, -0.3]).unwrap();
+        let mut tape = Tape::new();
+        let left_id = tape.leaf(left.clone());
+        let right_id = tape.leaf(right.clone());
+        let output = tape.sub(left_id, right_id).unwrap();
+        let gradients = tape.backward(output).unwrap();
+        check_gradient(&gradients[&left_id], &left, |value| {
+            value.sub(&right).unwrap().data().iter().sum()
+        });
+        check_gradient(&gradients[&right_id], &right, |value| {
+            left.sub(&value).unwrap().data().iter().sum()
+        });
+    }
+
+    #[test]
+    fn div_backward_matches_finite_differences_with_broadcasting() {
+        let left = Tensor::from_vec(vec![2, 2], vec![0.4, -0.7, 1.3, 0.2]).unwrap();
+        let right = Tensor::from_vec(vec![2], vec![0.6, -1.3]).unwrap();
+        let mut tape = Tape::new();
+        let left_id = tape.leaf(left.clone());
+        let right_id = tape.leaf(right.clone());
+        let output = tape.div(left_id, right_id).unwrap();
+        let gradients = tape.backward(output).unwrap();
+        check_gradient(&gradients[&left_id], &left, |value| {
+            value.div(&right).unwrap().data().iter().sum()
+        });
+        check_gradient(&gradients[&right_id], &right, |value| {
+            left.div(&value).unwrap().data().iter().sum()
+        });
+    }
+
+    #[test]
+    fn exp_backward_matches_finite_differences() {
+        let values = Tensor::from_vec(vec![4], vec![-1.2, -0.4, 0.3, 1.5]).unwrap();
+        let mut tape = Tape::new();
+        let input = tape.leaf(values.clone());
+        let output = tape.exp(input).unwrap();
+        let gradients = tape.backward(output).unwrap();
+        check_gradient(&gradients[&input], &values, |value| {
+            value.exp().unwrap().data().iter().sum()
+        });
+    }
+
+    #[test]
+    fn log_backward_matches_finite_differences() {
+        let values = Tensor::from_vec(vec![4], vec![0.3, 0.8, 1.7, 3.2]).unwrap();
+        let mut tape = Tape::new();
+        let input = tape.leaf(values.clone());
+        let output = tape.log(input).unwrap();
+        let gradients = tape.backward(output).unwrap();
+        check_gradient(&gradients[&input], &values, |value| {
+            value.log().unwrap().data().iter().sum()
         });
     }
 
