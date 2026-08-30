@@ -5,11 +5,12 @@ use crate::nn::{
     Embedding as RustEmbedding, Gpt, Initializer, LayerNorm as RustLayerNorm, Linear as RustLinear,
     Module as RustModule,
 };
-use crate::optim::{Adam, clip_gradients, gradient_norms};
+use crate::optim::{Adam, AdamError, Sgd, clip_gradients, gradient_norms};
 use crate::visualizer::VisualizerServer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use std::collections::HashMap;
 use std::fmt::Display;
 
 fn value_error(error: impl Display) -> PyErr {
@@ -305,10 +306,36 @@ impl PyEmbedding {
     }
 }
 
+enum TrainerOptimizer {
+    Adam(Adam),
+    Sgd(Sgd),
+}
+
+impl TrainerOptimizer {
+    fn step(
+        &mut self,
+        tape: &mut Tape,
+        parameters: &[TensorId],
+        gradients: &HashMap<TensorId, Tensor>,
+    ) -> Result<(), AdamError> {
+        match self {
+            Self::Adam(optimizer) => optimizer.step(tape, parameters, gradients),
+            Self::Sgd(optimizer) => optimizer.step(tape, parameters, gradients),
+        }
+    }
+
+    fn zero_grad(&self, gradients: &mut HashMap<TensorId, Tensor>) {
+        match self {
+            Self::Adam(optimizer) => optimizer.zero_grad(gradients),
+            Self::Sgd(optimizer) => optimizer.zero_grad(gradients),
+        }
+    }
+}
+
 #[pyclass(name = "GPT", extends = PyModuleBase, module = "glassbox.nn")]
 pub struct PyGpt {
     model: Gpt,
-    optimizer: Adam,
+    optimizer: TrainerOptimizer,
     visualizer: Option<VisualizerServer>,
     step: u64,
     trace_interval: u64,
@@ -317,7 +344,7 @@ pub struct PyGpt {
 #[pymethods]
 impl PyGpt {
     #[new]
-    #[pyo3(signature = (vocab_size, block_size, n_layer, n_head, n_embd, seed = 1337, learning_rate = 3e-4))]
+    #[pyo3(signature = (vocab_size, block_size, n_layer, n_head, n_embd, seed = 1337, learning_rate = 3e-4, optimizer = "adam", weight_decay = 0.0))]
     fn new(
         vocab_size: usize,
         block_size: usize,
@@ -326,12 +353,33 @@ impl PyGpt {
         n_embd: usize,
         seed: u64,
         learning_rate: f32,
+        optimizer: &str,
+        weight_decay: f32,
     ) -> PyResult<PyClassInitializer<Self>> {
+        if weight_decay < 0.0 {
+            return Err(PyValueError::new_err("weight_decay must be non-negative"));
+        }
+        let optimizer = match optimizer {
+            "adam" => TrainerOptimizer::Adam(
+                Adam::new(learning_rate, 0.9, 0.999, 1e-8).with_weight_decay(weight_decay),
+            ),
+            "sgd" if weight_decay == 0.0 => TrainerOptimizer::Sgd(Sgd::new(learning_rate)),
+            "sgd" => {
+                return Err(PyValueError::new_err(
+                    "weight_decay is only supported with optimizer='adam'",
+                ));
+            }
+            value => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown optimizer {value:?}; use 'adam' or 'sgd'"
+                )));
+            }
+        };
         let model = Gpt::new_with_seed(vocab_size, block_size, n_layer, n_head, n_embd, seed)
             .map_err(value_error)?;
         Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self {
             model,
-            optimizer: Adam::new(learning_rate, 0.9, 0.999, 1e-8),
+            optimizer,
             visualizer: None,
             step: 0,
             trace_interval: 1,

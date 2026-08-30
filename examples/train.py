@@ -15,6 +15,8 @@ def main():
     parser.add_argument("--n-layer", type=int, default=2)
     parser.add_argument("--n-embd", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--optimizer", choices=("adam", "sgd"), default="adam")
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--overfit", action="store_true")
     parser.add_argument("--output", default="artifacts/loss_curve.csv")
@@ -35,6 +37,8 @@ def main():
         args.n_embd,
         seed=args.seed,
         learning_rate=args.learning_rate,
+        optimizer=args.optimizer,
+        weight_decay=args.weight_decay,
     )
 
     if args.visualizer:

@@ -24,9 +24,12 @@ maturin develop
 python examples/train.py --steps 100
 python examples/train.py --steps 300 --output artifacts/long_run_curve.csv
 python examples/train.py --steps 200 --overfit
+python examples/train.py --steps 100 --optimizer sgd --learning-rate 1e-2
 ```
 
 The script reports step-0 loss against `ln(vocab_size)`, validation loss, and every parameter gradient norm. The committed short and 300-step stability curves are documented in `artifacts/README.md`; generated model checkpoints remain ignored.
+
+Choose plain SGD with `--optimizer sgd`. For Adam, `--weight-decay` applies decoupled AdamW weight decay.
 
 ## Visualizer design
 

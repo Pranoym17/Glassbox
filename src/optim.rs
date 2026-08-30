@@ -36,6 +36,7 @@ pub struct Adam {
     beta1: f32,
     beta2: f32,
     epsilon: f32,
+    weight_decay: f32,
     step: u64,
     first_moment: HashMap<TensorId, Vec<f32>>,
     second_moment: HashMap<TensorId, Vec<f32>>,
@@ -48,10 +49,16 @@ impl Adam {
             beta1,
             beta2,
             epsilon,
+            weight_decay: 0.0,
             step: 0,
             first_moment: HashMap::new(),
             second_moment: HashMap::new(),
         }
+    }
+
+    pub fn with_weight_decay(mut self, weight_decay: f32) -> Self {
+        self.weight_decay = weight_decay;
+        self
     }
 
     pub fn step(
@@ -93,8 +100,9 @@ impl Adam {
                     + (1.0 - self.beta2) * gradient.data()[index].powi(2);
                 let corrected_first = first[index] / first_correction;
                 let corrected_second = second[index] / second_correction;
+                let adaptive = corrected_first / (corrected_second.sqrt() + self.epsilon);
                 values[index] -=
-                    self.learning_rate * corrected_first / (corrected_second.sqrt() + self.epsilon);
+                    self.learning_rate * (adaptive + self.weight_decay * parameter.data()[index]);
             }
             tape.overwrite_leaf(id, Tensor::from_vec(parameter.shape().to_vec(), values)?)?;
         }
@@ -109,6 +117,51 @@ impl Adam {
 impl Default for Adam {
     fn default() -> Self {
         Self::new(3e-4, 0.9, 0.999, 1e-8)
+    }
+}
+
+pub struct Sgd {
+    learning_rate: f32,
+}
+
+impl Sgd {
+    pub fn new(learning_rate: f32) -> Self {
+        Self { learning_rate }
+    }
+
+    pub fn step(
+        &mut self,
+        tape: &mut Tape,
+        parameters: &[TensorId],
+        gradients: &HashMap<TensorId, Tensor>,
+    ) -> Result<(), AdamError> {
+        for &id in parameters {
+            let parameter = tape.value(id)?;
+            let gradient = gradients.get(&id).ok_or(AdamError::MissingGradient(id))?;
+            if parameter.shape() != gradient.shape() {
+                return Err(TapeError::Tensor(crate::TensorError::IncompatibleShapes {
+                    left: parameter.shape().to_vec(),
+                    right: gradient.shape().to_vec(),
+                })
+                .into());
+            }
+        }
+        for &id in parameters {
+            let parameter = tape.value(id)?.clone();
+            let gradient = &gradients[&id];
+            let values = parameter
+                .data()
+                .iter()
+                .zip(gradient.data())
+                .map(|(value, gradient)| value - self.learning_rate * gradient)
+                .collect();
+            tape.overwrite_leaf(id, Tensor::from_vec(parameter.shape().to_vec(), values)?)?;
+        }
+        Ok(())
+    }
+
+    pub fn zero_grad(&self, gradients: &mut HashMap<TensorId, Tensor>) {
+        gradients.clear();
     }
 }
 
@@ -193,5 +246,33 @@ mod tests {
         assert!((norm - 5.0).abs() < 1e-6);
         assert!((gradients[&0].data()[0] - 0.6).abs() < 1e-6);
         assert!((gradients[&1].data()[0] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sgd_converges_on_quadratic() {
+        let mut tape = Tape::new();
+        let parameter = tape.leaf(Tensor::from_vec(vec![], vec![0.0]).unwrap());
+        let offset = tape.leaf(Tensor::from_vec(vec![], vec![-3.0]).unwrap());
+        let checkpoint = tape.entry_count();
+        let mut optimizer = Sgd::new(0.1);
+        for _ in 0..100 {
+            let difference = tape.add(parameter, offset).unwrap();
+            let loss = tape.mul(difference, difference).unwrap();
+            let mut gradients = tape.backward(loss).unwrap();
+            optimizer.step(&mut tape, &[parameter], &gradients).unwrap();
+            optimizer.zero_grad(&mut gradients);
+            tape.reset(checkpoint).unwrap();
+        }
+        assert!((tape.value(parameter).unwrap().data()[0] - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn adam_weight_decay_is_decoupled_from_gradient() {
+        let mut tape = Tape::new();
+        let parameter = tape.leaf(Tensor::from_vec(vec![1], vec![2.0]).unwrap());
+        let gradients = HashMap::from([(parameter, Tensor::from_vec(vec![1], vec![0.0]).unwrap())]);
+        let mut optimizer = Adam::new(0.1, 0.9, 0.999, 1e-8).with_weight_decay(0.2);
+        optimizer.step(&mut tape, &[parameter], &gradients).unwrap();
+        assert!((tape.value(parameter).unwrap().data()[0] - 1.96).abs() < 1e-6);
     }
 }
