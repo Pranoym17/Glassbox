@@ -70,6 +70,13 @@ impl PyTensor {
         })
     }
 
+    #[pyo3(signature = (other, atol = 1e-8, rtol = 1e-5))]
+    fn isclose(&self, other: &Self, atol: f32, rtol: f32) -> PyResult<bool> {
+        self.inner
+            .is_close(&other.inner, atol, rtol)
+            .map_err(value_error)
+    }
+
     fn __add__(&self, other: &Self) -> PyResult<Self> {
         self.add(other)
     }
@@ -101,6 +108,14 @@ impl PyTensor {
 
 #[pyclass(name = "Module", subclass, module = "glassbox.nn")]
 pub struct PyModuleBase;
+
+#[pyfunction]
+#[pyo3(signature = (left, right, atol = 1e-8, rtol = 1e-5))]
+fn isclose(left: &PyTensor, right: &PyTensor, atol: f32, rtol: f32) -> PyResult<bool> {
+    left.inner
+        .is_close(&right.inner, atol, rtol)
+        .map_err(value_error)
+}
 
 fn parameters(tape: &Tape, ids: Vec<TensorId>) -> PyResult<Vec<PyTensor>> {
     ids.into_iter()
@@ -390,6 +405,7 @@ impl PyCharDataset {
 #[pymodule]
 pub fn glassbox(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTensor>()?;
+    module.add_function(wrap_pyfunction!(isclose, module)?)?;
     let nn = PyModule::new(py, "glassbox.nn")?;
     nn.add_class::<PyModuleBase>()?;
     nn.add_class::<PyLinear>()?;

@@ -11,6 +11,10 @@ right = gb.Tensor([0.5, 1.5], [2, 1])
 assert (left @ right).shape == [2, 1]
 assert (left + left).data == [2.0, 4.0, 6.0, 8.0]
 assert "shape=[2, 2]" in repr(left)
+near = gb.Tensor([1.000001, 1.999999, 3.000001, 3.999999], [2, 2])
+assert gb.isclose(near, left)
+assert near.isclose(left)
+assert not gb.isclose(gb.Tensor([1.1, 2.0, 3.0, 4.0], [2, 2]), left)
 
 try:
     gb.Tensor([1.0], [2])

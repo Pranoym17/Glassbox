@@ -188,6 +188,22 @@ impl Tensor {
         self.unary_op(f32::ln)
     }
 
+    pub fn is_close(&self, rhs: &Self, atol: f32, rtol: f32) -> Result<bool, TensorError> {
+        if self.shape != rhs.shape {
+            return Err(TensorError::IncompatibleShapes {
+                left: self.shape.clone(),
+                right: rhs.shape.clone(),
+            });
+        }
+        let left = self.contiguous();
+        let right = rhs.contiguous();
+        Ok(left
+            .data
+            .iter()
+            .zip(&right.data)
+            .all(|(&a, &b)| (a - b).abs() <= atol + rtol * b.abs()))
+    }
+
     pub fn matmul(&self, rhs: &Self) -> Result<Self, TensorError> {
         if self.shape.len() != 2 || rhs.shape.len() != 2 || self.shape[1] != rhs.shape[0] {
             return Err(TensorError::IncompatibleMatMul {
@@ -482,6 +498,24 @@ mod tests {
         assert_eq!(
             left.sum_axis(2).unwrap_err(),
             TensorError::InvalidAxis { axis: 2, rank: 2 }
+        );
+    }
+
+    #[test]
+    fn is_close_uses_absolute_and_relative_tolerances() {
+        let reference = Tensor::from_vec(vec![3], vec![0.0, 1.0, 10_000.0]).unwrap();
+        let close = Tensor::from_vec(vec![3], vec![5e-6, 1.000_005, 10_000.5]).unwrap();
+        let far = Tensor::from_vec(vec![3], vec![2e-5, 1.0, 10_000.0]).unwrap();
+        assert!(close.is_close(&reference, 1e-5, 1e-4).unwrap());
+        assert!(!far.is_close(&reference, 1e-5, 1e-4).unwrap());
+        assert_eq!(
+            reference
+                .is_close(&Tensor::zeros(vec![1, 3]).unwrap(), 1e-5, 1e-4)
+                .unwrap_err(),
+            TensorError::IncompatibleShapes {
+                left: vec![3],
+                right: vec![1, 3]
+            }
         );
     }
 }
