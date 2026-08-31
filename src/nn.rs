@@ -622,6 +622,7 @@ fn read_u64(file: &mut File) -> Result<u64, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optim::Adam;
 
     #[test]
     fn initialization_is_deterministic() {
@@ -819,5 +820,50 @@ mod tests {
         assert_eq!(first_tokens.len(), prompt.len() + 8);
         assert!(first_tokens.iter().all(|&token| token < 17));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fixed_seed_training_is_bit_reproducible() {
+        fn train() -> (Gpt, Vec<u32>) {
+            let mut model = Gpt::new_with_seed(17, 4, 1, 1, 8, 42).unwrap();
+            let mut optimizer = Adam::new(1e-3, 0.9, 0.999, 1e-8);
+            let tokens = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]];
+            let targets = vec![vec![2, 3, 4, 5], vec![6, 7, 8, 9]];
+            let mut losses = Vec::new();
+            for _ in 0..4 {
+                model.reset_tape().unwrap();
+                let loss = model.loss(&tokens, &targets).unwrap();
+                losses.push(model.loss_value(loss).unwrap().to_bits());
+                let mut gradients = model.backward(loss).unwrap();
+                let parameters = model.parameters();
+                optimizer
+                    .step(model.tape_mut(), &parameters, &gradients)
+                    .unwrap();
+                optimizer.zero_grad(&mut gradients);
+            }
+            model.reset_tape().unwrap();
+            (model, losses)
+        }
+
+        let (first, first_losses) = train();
+        let (second, second_losses) = train();
+        assert_eq!(first_losses, second_losses);
+        assert_eq!(
+            first.parameter_values().unwrap(),
+            second.parameter_values().unwrap()
+        );
+
+        let temporary = std::env::temp_dir();
+        let process = std::process::id();
+        let first_path = temporary.join(format!("glassbox-repro-first-{process}.gbx"));
+        let second_path = temporary.join(format!("glassbox-repro-second-{process}.gbx"));
+        first.save_checkpoint(&first_path).unwrap();
+        second.save_checkpoint(&second_path).unwrap();
+        assert_eq!(
+            std::fs::read(&first_path).unwrap(),
+            std::fs::read(&second_path).unwrap()
+        );
+        std::fs::remove_file(first_path).unwrap();
+        std::fs::remove_file(second_path).unwrap();
     }
 }
