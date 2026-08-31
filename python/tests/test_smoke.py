@@ -4,6 +4,15 @@ import random
 import tempfile
 
 import glassbox as gb
+import glassbox.data as data
+import glassbox.nn as nn
+import glassbox.optim as optim
+from glassbox.nn import Linear
+from glassbox.optim import SGD
+
+assert SGD is optim.SGD
+assert data.CharDataset is gb.data.CharDataset
+assert Linear is nn.Linear
 
 
 left = gb.Tensor([1.0, 2.0, 3.0, 4.0], [2, 2])

@@ -803,13 +803,22 @@ pub fn glassbox(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     nn.add_class::<PyTanh>()?;
     nn.add_class::<PyGpt>()?;
     module.add_submodule(&nn)?;
+    py.import("sys")?
+        .getattr("modules")?
+        .set_item("glassbox.nn", &nn)?;
     let data = PyModule::new(py, "glassbox.data")?;
     data.add_class::<PyCharDataset>()?;
     module.add_submodule(&data)?;
+    py.import("sys")?
+        .getattr("modules")?
+        .set_item("glassbox.data", &data)?;
     let optim = PyModule::new(py, "glassbox.optim")?;
     optim.add_class::<PyAdam>()?;
     optim.add_class::<PySgd>()?;
     module.add_submodule(&optim)?;
+    py.import("sys")?
+        .getattr("modules")?
+        .set_item("glassbox.optim", &optim)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
