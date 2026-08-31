@@ -573,9 +573,51 @@ impl TrainerOptimizer {
     }
 }
 
-#[pyclass(name = "GPT", extends = PyModuleBase, module = "glassbox.nn")]
-pub struct PyGpt {
+struct GptState {
     model: Gpt,
+    gradients: HashMap<TensorId, Tensor>,
+}
+
+#[pyclass(unsendable, name = "Loss", module = "glassbox")]
+pub struct PyGptLoss {
+    state: Rc<RefCell<GptState>>,
+    id: TensorId,
+    value: f32,
+}
+
+impl PyGptLoss {
+    fn backward_inner(&self) -> PyResult<Vec<f32>> {
+        let mut state = self.state.borrow_mut();
+        let gradients = state.model.backward(self.id).map_err(value_error)?;
+        let norms = gradient_norms(&state.model.parameters(), &gradients);
+        state.gradients = gradients;
+        Ok(norms)
+    }
+}
+
+#[pymethods]
+impl PyGptLoss {
+    #[getter]
+    fn value(&self) -> f32 {
+        self.value
+    }
+
+    fn backward(&self) -> PyResult<Vec<f32>> {
+        self.backward_inner()
+    }
+
+    fn __float__(&self) -> f32 {
+        self.value
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Loss({})", self.value)
+    }
+}
+
+#[pyclass(unsendable, name = "GPT", extends = PyModuleBase, module = "glassbox.nn")]
+pub struct PyGpt {
+    state: Rc<RefCell<GptState>>,
     optimizer: TrainerOptimizer,
     visualizer: Option<VisualizerServer>,
     step: u64,
@@ -620,7 +662,10 @@ impl PyGpt {
         let model = Gpt::new_with_seed(vocab_size, block_size, n_layer, n_head, n_embd, seed)
             .map_err(value_error)?;
         Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self {
-            model,
+            state: Rc::new(RefCell::new(GptState {
+                model,
+                gradients: HashMap::new(),
+            })),
             optimizer,
             visualizer: None,
             step: 0,
@@ -629,9 +674,13 @@ impl PyGpt {
     }
 
     fn forward(&mut self, tokens: Vec<Vec<usize>>) -> PyResult<PyTensor> {
-        Ok(PyTensor::eager(
-            self.model.forward(&tokens).map_err(value_error)?,
-        ))
+        let output = self
+            .state
+            .borrow_mut()
+            .model
+            .forward(&tokens)
+            .map_err(value_error)?;
+        Ok(PyTensor::eager(output))
     }
 
     #[pyo3(signature = (prompt, max_new_tokens, temperature = 1.0, top_k = None, seed = 1337))]
@@ -643,9 +692,52 @@ impl PyGpt {
         top_k: Option<usize>,
         seed: u64,
     ) -> PyResult<Vec<usize>> {
-        self.model
+        self.state
+            .borrow_mut()
+            .model
             .generate(&prompt, max_new_tokens, temperature, top_k, seed)
             .map_err(value_error)
+    }
+
+    fn loss(&mut self, tokens: Vec<Vec<usize>>, targets: Vec<Vec<usize>>) -> PyResult<PyGptLoss> {
+        let mut state = self.state.borrow_mut();
+        state.model.reset_tape().map_err(value_error)?;
+        let id = state.model.loss(&tokens, &targets).map_err(value_error)?;
+        let value = state.model.loss_value(id).map_err(value_error)?;
+        state.gradients.clear();
+        drop(state);
+        Ok(PyGptLoss {
+            state: Rc::clone(&self.state),
+            id,
+            value,
+        })
+    }
+
+    fn backward(&self, loss: &PyGptLoss) -> PyResult<Vec<f32>> {
+        if !Rc::ptr_eq(&self.state, &loss.state) {
+            return Err(PyValueError::new_err(
+                "loss was created by a different GPT model",
+            ));
+        }
+        loss.backward_inner()
+    }
+
+    #[pyo3(signature = (maximum_norm = 1.0))]
+    fn step(&mut self, maximum_norm: f32) -> PyResult<()> {
+        let mut state = self.state.borrow_mut();
+        let parameters = state.model.parameters();
+        clip_gradients(&parameters, &mut state.gradients, maximum_norm).map_err(value_error)?;
+        let GptState { model, gradients } = &mut *state;
+        self.optimizer
+            .step(model.tape_mut(), &parameters, gradients)
+            .map_err(value_error)?;
+        self.step += 1;
+        Ok(())
+    }
+
+    fn zero_grad(&self) {
+        self.optimizer
+            .zero_grad(&mut self.state.borrow_mut().gradients);
     }
 
     #[pyo3(signature = (tokens, targets, maximum_norm = 1.0))]
@@ -656,26 +748,21 @@ impl PyGpt {
         maximum_norm: f32,
     ) -> PyResult<(f32, Vec<f32>)> {
         let traced = self.visualizer.is_some() && self.step.is_multiple_of(self.trace_interval);
-        self.model.set_trace(self.step, traced);
+        self.state.borrow_mut().model.set_trace(self.step, traced);
         let result: PyResult<(f32, Vec<f32>)> = (|| {
-            self.model.reset_tape().map_err(value_error)?;
-            let loss = self.model.loss(&tokens, &targets).map_err(value_error)?;
-            let value = self.model.loss_value(loss).map_err(value_error)?;
-            let mut gradients = self.model.backward(loss).map_err(value_error)?;
-            let parameters = self.model.parameters();
-            let norms = gradient_norms(&parameters, &gradients);
-            clip_gradients(&parameters, &mut gradients, maximum_norm).map_err(value_error)?;
-            self.optimizer
-                .step(self.model.tape_mut(), &parameters, &gradients)
+            let loss = self.loss(tokens, targets)?;
+            let value = loss.value;
+            let norms = loss.backward_inner()?;
+            self.step(maximum_norm)?;
+            self.zero_grad();
+            self.state
+                .borrow_mut()
+                .model
+                .reset_tape()
                 .map_err(value_error)?;
-            self.optimizer.zero_grad(&mut gradients);
-            self.model.reset_tape().map_err(value_error)?;
             Ok((value, norms))
         })();
-        self.model.set_trace(self.step, false);
-        if result.is_ok() {
-            self.step += 1;
-        }
+        self.state.borrow_mut().model.set_trace(self.step, false);
         result
     }
 
@@ -692,15 +779,19 @@ impl PyGpt {
         self.disable_visualizer();
         let server = VisualizerServer::start(port, capacity).map_err(value_error)?;
         let url = server.url();
-        self.model.set_event_emitter(Some(server.emitter()));
+        self.state
+            .borrow_mut()
+            .model
+            .set_event_emitter(Some(server.emitter()));
         self.trace_interval = trace_interval;
         self.visualizer = Some(server);
         Ok(url)
     }
 
     fn disable_visualizer(&mut self) {
-        self.model.set_event_emitter(None);
-        self.model.set_trace(self.step, false);
+        let mut state = self.state.borrow_mut();
+        state.model.set_event_emitter(None);
+        state.model.set_trace(self.step, false);
         self.visualizer = None;
     }
 
@@ -712,23 +803,34 @@ impl PyGpt {
     }
 
     fn evaluate(&mut self, tokens: Vec<Vec<usize>>, targets: Vec<Vec<usize>>) -> PyResult<f32> {
-        self.model.reset_tape().map_err(value_error)?;
-        let loss = self.model.loss(&tokens, &targets).map_err(value_error)?;
-        let value = self.model.loss_value(loss).map_err(value_error)?;
-        self.model.reset_tape().map_err(value_error)?;
+        let mut state = self.state.borrow_mut();
+        state.model.reset_tape().map_err(value_error)?;
+        let loss = state.model.loss(&tokens, &targets).map_err(value_error)?;
+        let value = state.model.loss_value(loss).map_err(value_error)?;
+        state.model.reset_tape().map_err(value_error)?;
         Ok(value)
     }
 
     fn save_checkpoint(&self, path: &str) -> PyResult<()> {
-        self.model.save_checkpoint(path).map_err(value_error)
+        self.state
+            .borrow()
+            .model
+            .save_checkpoint(path)
+            .map_err(value_error)
     }
 
     fn load_checkpoint(&mut self, path: &str) -> PyResult<()> {
-        self.model.load_checkpoint(path).map_err(value_error)
+        self.state
+            .borrow_mut()
+            .model
+            .load_checkpoint(path)
+            .map_err(value_error)
     }
 
     fn parameters(&self) -> PyResult<Vec<PyTensor>> {
         Ok(self
+            .state
+            .borrow()
             .model
             .parameter_values()
             .map_err(value_error)?
@@ -792,6 +894,7 @@ impl PyCharDataset {
 #[pymodule]
 pub fn glassbox(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTensor>()?;
+    module.add_class::<PyGptLoss>()?;
     module.add_function(wrap_pyfunction!(isclose, module)?)?;
     let nn = PyModule::new(py, "glassbox.nn")?;
     nn.add_class::<PyModuleBase>()?;
