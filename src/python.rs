@@ -10,98 +10,227 @@ use crate::visualizer::VisualizerServer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::rc::Rc;
 
 fn value_error(error: impl Display) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
-#[pyclass(name = "Tensor", module = "glassbox")]
+struct PythonGraph {
+    tape: RefCell<Tape>,
+    gradients: RefCell<HashMap<TensorId, Tensor>>,
+}
+
+impl PythonGraph {
+    fn new() -> Self {
+        Self {
+            tape: RefCell::new(Tape::new()),
+            gradients: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+thread_local! {
+    static DEFAULT_GRAPH: Rc<PythonGraph> = Rc::new(PythonGraph::new());
+}
+
+fn default_graph() -> Rc<PythonGraph> {
+    DEFAULT_GRAPH.with(Rc::clone)
+}
+
+#[pyclass(unsendable, name = "Tensor", module = "glassbox")]
 pub struct PyTensor {
     inner: Tensor,
+    graph: Option<Rc<PythonGraph>>,
+    id: Option<TensorId>,
+}
+
+impl PyTensor {
+    fn eager(inner: Tensor) -> Self {
+        Self {
+            inner,
+            graph: None,
+            id: None,
+        }
+    }
+
+    fn from_graph(graph: Rc<PythonGraph>, id: TensorId) -> PyResult<Self> {
+        let inner = graph.tape.borrow().value(id).map_err(value_error)?.clone();
+        Ok(Self {
+            inner,
+            graph: Some(graph),
+            id: Some(id),
+        })
+    }
+
+    fn value(&self) -> PyResult<Tensor> {
+        match (&self.graph, self.id) {
+            (Some(graph), Some(id)) => graph.tape.borrow().value(id).cloned().map_err(value_error),
+            _ => Ok(self.inner.clone()),
+        }
+    }
+
+    fn id_on(&self, graph: &Rc<PythonGraph>) -> PyResult<TensorId> {
+        match (&self.graph, self.id) {
+            (Some(current), Some(id)) if Rc::ptr_eq(current, graph) => Ok(id),
+            (Some(_), Some(_)) => Err(PyValueError::new_err(
+                "cannot combine tensors from different autograd tapes",
+            )),
+            _ => Ok(graph.tape.borrow_mut().leaf(self.inner.clone())),
+        }
+    }
+
+    fn binary_op(&self, other: &Self, operation: &str) -> PyResult<Self> {
+        if let (Some(left), Some(right)) = (&self.graph, &other.graph)
+            && !Rc::ptr_eq(left, right)
+        {
+            return Err(PyValueError::new_err(
+                "cannot combine tensors from different autograd tapes",
+            ));
+        }
+        let graph = self.graph.clone().or_else(|| other.graph.clone());
+        if let Some(graph) = graph {
+            let left = self.id_on(&graph)?;
+            let right = other.id_on(&graph)?;
+            let output = {
+                let mut tape = graph.tape.borrow_mut();
+                match operation {
+                    "add" => tape.add(left, right),
+                    "mul" => tape.mul(left, right),
+                    "sub" => tape.sub(left, right),
+                    "div" => tape.div(left, right),
+                    "matmul" => tape.matmul(left, right),
+                    _ => unreachable!(),
+                }
+                .map_err(value_error)?
+            };
+            Self::from_graph(graph, output)
+        } else {
+            let output = match operation {
+                "add" => self.inner.add(&other.inner),
+                "mul" => self.inner.mul(&other.inner),
+                "sub" => self.inner.sub(&other.inner),
+                "div" => self.inner.div(&other.inner),
+                "matmul" => self.inner.matmul(&other.inner),
+                _ => unreachable!(),
+            }
+            .map_err(value_error)?;
+            Ok(Self::eager(output))
+        }
+    }
+
+    fn unary_op(&self, operation: &str) -> PyResult<Self> {
+        if let Some(graph) = self.graph.clone() {
+            let input = self.id.expect("graph tensors have ids");
+            let output = {
+                let mut tape = graph.tape.borrow_mut();
+                match operation {
+                    "relu" => tape.relu(input),
+                    "sigmoid" => tape.sigmoid(input),
+                    "tanh" => tape.tanh(input),
+                    _ => unreachable!(),
+                }
+                .map_err(value_error)?
+            };
+            Self::from_graph(graph, output)
+        } else {
+            let output = match operation {
+                "relu" => self.inner.relu(),
+                "sigmoid" => self.inner.sigmoid(),
+                "tanh" => self.inner.tanh(),
+                _ => unreachable!(),
+            }
+            .map_err(value_error)?;
+            Ok(Self::eager(output))
+        }
+    }
 }
 
 #[pymethods]
 impl PyTensor {
     #[new]
     fn new(data: Vec<f32>, shape: Vec<usize>) -> PyResult<Self> {
-        Ok(Self {
-            inner: Tensor::from_vec(shape, data).map_err(value_error)?,
-        })
+        Ok(Self::eager(
+            Tensor::from_vec(shape, data).map_err(value_error)?,
+        ))
     }
 
     #[getter]
-    fn shape(&self) -> Vec<usize> {
-        self.inner.shape().to_vec()
+    fn shape(&self) -> PyResult<Vec<usize>> {
+        Ok(self.value()?.shape().to_vec())
     }
 
     #[getter]
-    fn data(&self) -> Vec<f32> {
-        self.inner.data().to_vec()
+    fn data(&self) -> PyResult<Vec<f32>> {
+        Ok(self.value()?.data().to_vec())
     }
 
     fn add(&self, other: &Self) -> PyResult<Self> {
-        Ok(Self {
-            inner: self.inner.add(&other.inner).map_err(value_error)?,
-        })
+        self.binary_op(other, "add")
     }
 
     fn mul(&self, other: &Self) -> PyResult<Self> {
-        Ok(Self {
-            inner: self.inner.mul(&other.inner).map_err(value_error)?,
-        })
+        self.binary_op(other, "mul")
     }
 
     fn sub(&self, other: &Self) -> PyResult<Self> {
-        Ok(Self {
-            inner: self.inner.sub(&other.inner).map_err(value_error)?,
-        })
+        self.binary_op(other, "sub")
     }
 
     fn div(&self, other: &Self) -> PyResult<Self> {
-        Ok(Self {
-            inner: self.inner.div(&other.inner).map_err(value_error)?,
-        })
+        self.binary_op(other, "div")
     }
 
     fn matmul(&self, other: &Self) -> PyResult<Self> {
-        Ok(Self {
-            inner: self.inner.matmul(&other.inner).map_err(value_error)?,
-        })
+        self.binary_op(other, "matmul")
     }
 
     fn relu(&self) -> PyResult<Self> {
-        Ok(Self {
-            inner: self.inner.relu().map_err(value_error)?,
-        })
+        self.unary_op("relu")
     }
 
     fn sigmoid(&self) -> PyResult<Self> {
-        Ok(Self {
-            inner: self.inner.sigmoid().map_err(value_error)?,
-        })
+        self.unary_op("sigmoid")
     }
 
     fn tanh(&self) -> PyResult<Self> {
-        Ok(Self {
-            inner: self.inner.tanh().map_err(value_error)?,
-        })
+        self.unary_op("tanh")
     }
 
-    /// Returns a shared-storage handle; eager Python tensors have no tape connection
-    /// to sever.
-    fn detach(&self) -> Self {
-        Self {
-            inner: self.inner.detach(),
-        }
+    /// Returns a shared-storage eager tensor that is disconnected from its source tape.
+    fn detach(&self) -> PyResult<Self> {
+        Ok(Self::eager(self.value()?.detach()))
     }
 
     #[pyo3(signature = (other, atol = 1e-8, rtol = 1e-5))]
     fn isclose(&self, other: &Self, atol: f32, rtol: f32) -> PyResult<bool> {
-        self.inner
-            .is_close(&other.inner, atol, rtol)
+        self.value()?
+            .is_close(&other.value()?, atol, rtol)
             .map_err(value_error)
+    }
+
+    fn backward(&self) -> PyResult<()> {
+        let (graph, id) = match (&self.graph, self.id) {
+            (Some(graph), Some(id)) => (graph, id),
+            _ => {
+                return Err(PyValueError::new_err(
+                    "cannot backpropagate through a detached tensor",
+                ));
+            }
+        };
+        let gradients = graph.tape.borrow().backward(id).map_err(value_error)?;
+        *graph.gradients.borrow_mut() = gradients;
+        Ok(())
+    }
+
+    #[getter]
+    fn grad(&self) -> Option<Self> {
+        let graph = self.graph.as_ref()?;
+        let gradient = graph.gradients.borrow().get(&self.id?).cloned()?;
+        Some(Self::eager(gradient))
     }
 
     fn __add__(&self, other: &Self) -> PyResult<Self> {
@@ -124,12 +253,13 @@ impl PyTensor {
         self.matmul(other)
     }
 
-    fn __repr__(&self) -> String {
-        format!(
+    fn __repr__(&self) -> PyResult<String> {
+        let value = self.value()?;
+        Ok(format!(
             "Tensor(shape={:?}, data={:?})",
-            self.inner.shape(),
-            self.inner.data()
-        )
+            value.shape(),
+            value.data()
+        ))
     }
 }
 
@@ -139,8 +269,8 @@ pub struct PyModuleBase;
 #[pyfunction]
 #[pyo3(signature = (left, right, atol = 1e-8, rtol = 1e-5))]
 fn isclose(left: &PyTensor, right: &PyTensor, atol: f32, rtol: f32) -> PyResult<bool> {
-    left.inner
-        .is_close(&right.inner, atol, rtol)
+    left.value()?
+        .is_close(&right.value()?, atol, rtol)
         .map_err(value_error)
 }
 
@@ -155,9 +285,7 @@ impl PyReLU {
     }
 
     fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
-        Ok(PyTensor {
-            inner: input.inner.relu().map_err(value_error)?,
-        })
+        input.relu()
     }
 }
 
@@ -172,9 +300,7 @@ impl PySigmoid {
     }
 
     fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
-        Ok(PyTensor {
-            inner: input.inner.sigmoid().map_err(value_error)?,
-        })
+        input.sigmoid()
     }
 }
 
@@ -189,25 +315,19 @@ impl PyTanh {
     }
 
     fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
-        Ok(PyTensor {
-            inner: input.inner.tanh().map_err(value_error)?,
-        })
+        input.tanh()
     }
 }
 
-fn parameters(tape: &Tape, ids: Vec<TensorId>) -> PyResult<Vec<PyTensor>> {
+fn parameters(graph: &Rc<PythonGraph>, ids: Vec<TensorId>) -> PyResult<Vec<PyTensor>> {
     ids.into_iter()
-        .map(|id| {
-            Ok(PyTensor {
-                inner: tape.value(id).map_err(value_error)?.clone(),
-            })
-        })
+        .map(|id| PyTensor::from_graph(Rc::clone(graph), id))
         .collect()
 }
 
-#[pyclass(name = "Linear", extends = PyModuleBase, module = "glassbox.nn")]
+#[pyclass(unsendable, name = "Linear", extends = PyModuleBase, module = "glassbox.nn")]
 pub struct PyLinear {
-    tape: Tape,
+    graph: Rc<PythonGraph>,
     layer: RustLinear,
 }
 
@@ -220,32 +340,35 @@ impl PyLinear {
         output_features: usize,
         seed: u64,
     ) -> PyResult<PyClassInitializer<Self>> {
-        let mut tape = Tape::new();
+        let graph = default_graph();
         let mut initializer = Initializer::new(seed);
-        let layer = RustLinear::new(&mut tape, input_features, output_features, &mut initializer)
-            .map_err(value_error)?;
-        Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self { tape, layer }))
+        let layer = RustLinear::new(
+            &mut graph.tape.borrow_mut(),
+            input_features,
+            output_features,
+            &mut initializer,
+        )
+        .map_err(value_error)?;
+        Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self { graph, layer }))
     }
 
-    fn forward(&mut self, input: &PyTensor) -> PyResult<PyTensor> {
-        let input = self.tape.leaf(input.inner.clone());
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let input = input.id_on(&self.graph)?;
         let output = self
             .layer
-            .forward(&mut self.tape, input)
+            .forward(&mut self.graph.tape.borrow_mut(), input)
             .map_err(value_error)?;
-        Ok(PyTensor {
-            inner: self.tape.value(output).map_err(value_error)?.clone(),
-        })
+        PyTensor::from_graph(Rc::clone(&self.graph), output)
     }
 
     fn parameters(&self) -> PyResult<Vec<PyTensor>> {
-        parameters(&self.tape, self.layer.parameters())
+        parameters(&self.graph, self.layer.parameters())
     }
 }
 
-#[pyclass(name = "LayerNorm", extends = PyModuleBase, module = "glassbox.nn")]
+#[pyclass(unsendable, name = "LayerNorm", extends = PyModuleBase, module = "glassbox.nn")]
 pub struct PyLayerNorm {
-    tape: Tape,
+    graph: Rc<PythonGraph>,
     layer: RustLayerNorm,
 }
 
@@ -254,30 +377,29 @@ impl PyLayerNorm {
     #[new]
     #[pyo3(signature = (features, epsilon = 1e-5))]
     fn new(features: usize, epsilon: f32) -> PyResult<PyClassInitializer<Self>> {
-        let mut tape = Tape::new();
-        let layer = RustLayerNorm::new(&mut tape, features, epsilon).map_err(value_error)?;
-        Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self { tape, layer }))
+        let graph = default_graph();
+        let layer = RustLayerNorm::new(&mut graph.tape.borrow_mut(), features, epsilon)
+            .map_err(value_error)?;
+        Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self { graph, layer }))
     }
 
-    fn forward(&mut self, input: &PyTensor) -> PyResult<PyTensor> {
-        let input = self.tape.leaf(input.inner.clone());
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let input = input.id_on(&self.graph)?;
         let output = self
             .layer
-            .forward(&mut self.tape, input)
+            .forward(&mut self.graph.tape.borrow_mut(), input)
             .map_err(value_error)?;
-        Ok(PyTensor {
-            inner: self.tape.value(output).map_err(value_error)?.clone(),
-        })
+        PyTensor::from_graph(Rc::clone(&self.graph), output)
     }
 
     fn parameters(&self) -> PyResult<Vec<PyTensor>> {
-        parameters(&self.tape, self.layer.parameters())
+        parameters(&self.graph, self.layer.parameters())
     }
 }
 
-#[pyclass(name = "Embedding", extends = PyModuleBase, module = "glassbox.nn")]
+#[pyclass(unsendable, name = "Embedding", extends = PyModuleBase, module = "glassbox.nn")]
 pub struct PyEmbedding {
-    tape: Tape,
+    graph: Rc<PythonGraph>,
     layer: RustEmbedding,
 }
 
@@ -286,25 +408,142 @@ impl PyEmbedding {
     #[new]
     #[pyo3(signature = (entries, features, seed = 1337))]
     fn new(entries: usize, features: usize, seed: u64) -> PyResult<PyClassInitializer<Self>> {
-        let mut tape = Tape::new();
+        let graph = default_graph();
         let mut initializer = Initializer::new(seed);
-        let layer = RustEmbedding::new(&mut tape, entries, features, &mut initializer)
-            .map_err(value_error)?;
-        Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self { tape, layer }))
+        let layer = RustEmbedding::new(
+            &mut graph.tape.borrow_mut(),
+            entries,
+            features,
+            &mut initializer,
+        )
+        .map_err(value_error)?;
+        Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self { graph, layer }))
     }
 
-    fn forward(&mut self, indices: Vec<usize>) -> PyResult<PyTensor> {
+    fn forward(&self, indices: Vec<usize>) -> PyResult<PyTensor> {
         let output = self
             .layer
-            .forward(&mut self.tape, indices)
+            .forward(&mut self.graph.tape.borrow_mut(), indices)
             .map_err(value_error)?;
-        Ok(PyTensor {
-            inner: self.tape.value(output).map_err(value_error)?.clone(),
-        })
+        PyTensor::from_graph(Rc::clone(&self.graph), output)
     }
 
     fn parameters(&self) -> PyResult<Vec<PyTensor>> {
-        parameters(&self.tape, self.layer.parameters())
+        parameters(&self.graph, self.layer.parameters())
+    }
+}
+
+fn optimizer_parameters(
+    py: Python<'_>,
+    parameters: Vec<Py<PyTensor>>,
+) -> PyResult<(Rc<PythonGraph>, Vec<TensorId>)> {
+    let first = parameters
+        .first()
+        .ok_or_else(|| PyValueError::new_err("optimizer requires at least one parameter"))?
+        .borrow(py);
+    let graph = first
+        .graph
+        .clone()
+        .ok_or_else(|| PyValueError::new_err("optimizer parameters must require gradients"))?;
+    drop(first);
+    let mut ids = Vec::with_capacity(parameters.len());
+    for parameter in parameters {
+        let parameter = parameter.borrow(py);
+        let current = parameter
+            .graph
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("optimizer parameters must require gradients"))?;
+        if !Rc::ptr_eq(&graph, current) {
+            return Err(PyValueError::new_err(
+                "optimizer parameters must belong to the same autograd tape",
+            ));
+        }
+        ids.push(parameter.id.expect("graph tensors have ids"));
+    }
+    Ok((graph, ids))
+}
+
+#[pyclass(unsendable, name = "Adam", module = "glassbox.optim")]
+pub struct PyAdam {
+    graph: Rc<PythonGraph>,
+    parameters: Vec<TensorId>,
+    optimizer: Adam,
+}
+
+#[pymethods]
+impl PyAdam {
+    #[new]
+    #[pyo3(signature = (parameters, learning_rate = 1e-3, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8, weight_decay = 0.0))]
+    fn new(
+        py: Python<'_>,
+        parameters: Vec<Py<PyTensor>>,
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+    ) -> PyResult<Self> {
+        if weight_decay < 0.0 {
+            return Err(PyValueError::new_err("weight_decay must be non-negative"));
+        }
+        let (graph, parameters) = optimizer_parameters(py, parameters)?;
+        Ok(Self {
+            graph,
+            parameters,
+            optimizer: Adam::new(learning_rate, beta1, beta2, epsilon)
+                .with_weight_decay(weight_decay),
+        })
+    }
+
+    fn step(&mut self) -> PyResult<()> {
+        self.optimizer
+            .step(
+                &mut self.graph.tape.borrow_mut(),
+                &self.parameters,
+                &self.graph.gradients.borrow(),
+            )
+            .map_err(value_error)
+    }
+
+    fn zero_grad(&self) {
+        self.optimizer
+            .zero_grad(&mut self.graph.gradients.borrow_mut());
+    }
+}
+
+#[pyclass(unsendable, name = "SGD", module = "glassbox.optim")]
+pub struct PySgd {
+    graph: Rc<PythonGraph>,
+    parameters: Vec<TensorId>,
+    optimizer: Sgd,
+}
+
+#[pymethods]
+impl PySgd {
+    #[new]
+    #[pyo3(signature = (parameters, learning_rate = 1e-2))]
+    fn new(py: Python<'_>, parameters: Vec<Py<PyTensor>>, learning_rate: f32) -> PyResult<Self> {
+        let (graph, parameters) = optimizer_parameters(py, parameters)?;
+        Ok(Self {
+            graph,
+            parameters,
+            optimizer: Sgd::new(learning_rate),
+        })
+    }
+
+    fn step(&mut self) -> PyResult<()> {
+        self.optimizer
+            .step(
+                &mut self.graph.tape.borrow_mut(),
+                &self.parameters,
+                &self.graph.gradients.borrow(),
+            )
+            .map_err(value_error)
+    }
+
+    fn zero_grad(&self) {
+        self.optimizer
+            .zero_grad(&mut self.graph.gradients.borrow_mut());
     }
 }
 
@@ -390,9 +629,9 @@ impl PyGpt {
     }
 
     fn forward(&mut self, tokens: Vec<Vec<usize>>) -> PyResult<PyTensor> {
-        Ok(PyTensor {
-            inner: self.model.forward(&tokens).map_err(value_error)?,
-        })
+        Ok(PyTensor::eager(
+            self.model.forward(&tokens).map_err(value_error)?,
+        ))
     }
 
     #[pyo3(signature = (prompt, max_new_tokens, temperature = 1.0, top_k = None, seed = 1337))]
@@ -494,7 +733,7 @@ impl PyGpt {
             .parameter_values()
             .map_err(value_error)?
             .into_iter()
-            .map(|inner| PyTensor { inner })
+            .map(PyTensor::eager)
             .collect())
     }
 }
@@ -567,6 +806,10 @@ pub fn glassbox(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     let data = PyModule::new(py, "glassbox.data")?;
     data.add_class::<PyCharDataset>()?;
     module.add_submodule(&data)?;
+    let optim = PyModule::new(py, "glassbox.optim")?;
+    optim.add_class::<PyAdam>()?;
+    optim.add_class::<PySgd>()?;
+    module.add_submodule(&optim)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

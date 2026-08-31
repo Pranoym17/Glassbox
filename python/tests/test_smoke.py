@@ -44,6 +44,33 @@ assert left.relu().shape == left.shape
 assert left.sigmoid().shape == left.shape
 assert left.tanh().shape == left.shape
 
+head = gb.nn.Linear(3, 1, seed=7)
+loss_tensor = head.forward(tanh.forward(linear.forward(left)))
+loss_tensor.backward()
+parameters = linear.parameters() + head.parameters()
+assert all(parameter.grad is not None for parameter in parameters)
+before = [parameter.data for parameter in parameters]
+sgd = gb.optim.SGD(parameters, learning_rate=1e-2)
+sgd.step()
+after = [parameter.data for parameter in parameters]
+assert any(old != new for old, new in zip(before, after))
+sgd.zero_grad()
+assert all(parameter.grad is None for parameter in parameters)
+
+adam_loss = head.forward(relu.forward(linear.forward(left)))
+adam_loss.backward()
+adam = gb.optim.Adam(parameters, learning_rate=1e-3, weight_decay=1e-2)
+adam.step()
+adam.zero_grad()
+assert all(parameter.grad is None for parameter in parameters)
+
+detached_hidden = linear.forward(left).detach()
+detached_loss = head.forward(tanh.forward(detached_hidden))
+detached_loss.backward()
+assert all(parameter.grad is None for parameter in linear.parameters())
+assert all(parameter.grad is not None for parameter in head.parameters())
+adam.zero_grad()
+
 random.seed(42)
 tokens = [[random.randrange(65) for _ in range(16)] for _ in range(2)]
 model = gb.nn.GPT(65, 16, 2, 1, 8)
