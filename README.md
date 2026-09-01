@@ -14,7 +14,7 @@ python python/tests/test_smoke.py
 
 The GPT and optimizer training path runs entirely on CPU tensors backed by shared host memory and currently supports one attention head. The separate forward-only CUDA backend copies host data to the device for each operation and has no CUDA backward kernels. GPU-accelerated training would require persistent device storage plus CUDA backward implementations; it is a scoped-out next step and is not wired into the training path.
 
-At the Rust tape level, detach creates a new leaf that severs the source graph connection while sharing the same CPU storage. Eager Python tensors do not carry a tape connection, so Python detach currently returns a separate shared-storage handle but has no gradient graph to sever.
+At the Rust tape level, detach creates a new leaf that severs the source graph connection while sharing the same CPU storage. Python tensors produced by differentiable modules carry the shared tape connection; `.detach()` returns an eager shared-storage tensor that stops gradient flow. Calling it on an already eager tensor simply returns another shared-storage eager handle.
 
 ## Train
 
@@ -22,7 +22,7 @@ The character dataset is vendored from the TinyShakespeare corpus at https://raw
 
 ```bash
 source .venv/bin/activate
-maturin develop
+maturin develop --release
 python examples/train.py --steps 100
 python examples/train.py --steps 300 --output artifacts/long_run_curve.csv
 python examples/train.py --steps 200 --overfit
@@ -31,13 +31,15 @@ python examples/train.py --steps 100 --optimizer sgd --learning-rate 1e-2
 
 The script reports step-0 loss against `ln(vocab_size)`, validation loss, and every parameter gradient norm. The committed short and 300-step stability curves are documented in `artifacts/README.md`; generated model checkpoints remain ignored.
 
+Use `maturin develop` for quick binding development and tests, but rebuild with `maturin develop --release` before real training. Release mode removes Rust debug-build overhead and is typically about 10-30x faster on this CPU-heavy path; the exact speedup depends on the model and machine.
+
 Choose plain SGD with `--optimizer sgd`. For Adam, `--weight-decay` applies decoupled AdamW weight decay.
 
 After saving the checkpoint, the training example loads it into a fresh model and prints an autoregressive sample. Use `--prompt`, `--generate-tokens`, `--temperature`, `--top-k`, and `--sample-seed` to control generation.
 
 ## Continuous integration
 
-The workflow runs formatting, linting, all CPU/autograd tests, and the Python smoke test on pushes and pull requests to main. It uses the cpu-only feature because free hosted runners do not provide a CUDA GPU. CUDA kernel tests remain part of the normal local cargo test run on an NVIDIA machine.
+The workflow runs formatting, linting, all CPU/autograd tests, the Python smoke test, and the Deno visualizer tests on pushes and pull requests to main. It uses the cpu-only feature because free hosted runners do not provide a CUDA GPU. CUDA kernel tests remain part of the normal local cargo test run on an NVIDIA machine.
 
 ## Visualizer design
 
@@ -57,4 +59,4 @@ The renderer represents each tensor once and draws one operation-labeled edge fo
 
 Backward edges point from outputs back to inputs in a separate orange hue. Their width and intensity use a logarithmic scale whose legend shows the actual minimum and maximum gradient norms. Fixture replay advances by event index rather than recorded wall-clock time. The page works from the built-in server, or can be double-clicked and given either JSON fixture through the file picker.
 
-Live mode keeps the five newest complete steps and exposes a selector for older buffered steps. Selecting a different step rebuilds the graph from that step alone because tape tensor IDs are reused. After an SSE reconnect, the first observed step is discarded conservatively so a stream that resumed mid-step cannot be rendered as complete.
+The D3 runtime is vendored with the page, so graph rendering does not require internet access. Live mode keeps the five newest complete steps and exposes a selector for older buffered steps. Selecting a different step rebuilds the graph from that step alone because tape tensor IDs are reused. After an SSE reconnect, the first observed step is discarded conservatively so a stream that resumed mid-step cannot be rendered as complete.
