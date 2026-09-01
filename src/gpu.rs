@@ -329,13 +329,12 @@ mod tests {
     use crate::Tensor;
 
     fn assert_close(gpu: &Tensor, cpu: &Tensor) {
-        assert_eq!(gpu.shape(), cpu.shape());
-        for (index, (&actual, &expected)) in gpu.data().iter().zip(cpu.data()).enumerate() {
-            assert!(
-                (actual - expected).abs() < 1e-5,
-                "mismatch at {index}: GPU={actual}, CPU={expected}"
-            );
-        }
+        assert!(
+            gpu.is_close(cpu, 1e-5, 1e-5).unwrap(),
+            "GPU {:?} did not match CPU {:?}",
+            gpu.data(),
+            cpu.data()
+        );
     }
 
     fn operands() -> (Tensor, Tensor) {
