@@ -5,16 +5,45 @@ Glassbox is a CPU-tape-based autograd engine with a CUDA kernel library validate
 ## Build and test
 
 ```bash
-cargo test
+cargo test --features cpu-only
 python3 -m venv .venv
 source .venv/bin/activate
-maturin develop
+maturin develop --features extension-module,cpu-only
 python python/tests/test_smoke.py
 ```
+
+The default commands intentionally exercise the CPU training and autograd path without requiring a CUDA compiler. To include the standalone CUDA kernel tests, put your toolkit's bin directory on PATH first:
+
+```bash
+export PATH=/usr/local/cuda/bin:$PATH
+cargo test
+```
+
+Replace `/usr/local/cuda` if the toolkit is installed elsewhere.
 
 The GPT and optimizer training path runs entirely on CPU tensors backed by shared host memory and currently supports one attention head. The separate forward-only CUDA backend copies host data to the device for each operation and has no CUDA backward kernels. GPU-accelerated training would require persistent device storage plus CUDA backward implementations; it is a scoped-out next step and is not wired into the training path.
 
 At the Rust tape level, detach creates a new leaf that severs the source graph connection while sharing the same CPU storage. Python tensors produced by differentiable modules carry the shared tape connection; `.detach()` returns an eager shared-storage tensor that stops gradient flow. Calling it on an already eager tensor simply returns another shared-storage eager handle.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Python["Python API<br/>Tensor, nn, optim, GPT"] --> PyO3["PyO3 bindings"]
+    PyO3 --> Core["Rust core<br/>Tensor, Tape, ops"]
+
+    Core --> Training["CPU training path<br/>GPT + Tape + Adam/SGD"]
+    Training --> CpuOps["CPU tensor operations<br/>forward + backward"]
+
+    Core -. "standalone forward calls" .-> Cuda["CUDA kernel library<br/>forward-only"]
+    Cuda -. "validated against" .-> CpuOps
+
+    Core --> Events["bounded autograd event stream"]
+    Events --> SSE["SSE server"]
+    SSE --> Visualizer["offline browser visualizer"]
+```
+
+The solid training path is CPU-backed. The dashed CUDA branch is a separately tested forward-kernel backend; it is not used by GPT training.
 
 ## Train
 
@@ -22,7 +51,7 @@ The character dataset is vendored from the TinyShakespeare corpus at https://raw
 
 ```bash
 source .venv/bin/activate
-maturin develop --release
+maturin develop --release --features extension-module,cpu-only
 python examples/train.py --steps 100
 python examples/train.py --steps 300 --output artifacts/long_run_curve.csv
 python examples/train.py --steps 200 --overfit
@@ -31,7 +60,7 @@ python examples/train.py --steps 100 --optimizer sgd --learning-rate 1e-2
 
 The script reports step-0 loss against `ln(vocab_size)`, validation loss, and every parameter gradient norm. The committed short and 300-step stability curves are documented in `artifacts/README.md`; generated model checkpoints remain ignored.
 
-Use `maturin develop` for quick binding development and tests, but rebuild with `maturin develop --release` before real training. Release mode removes Rust debug-build overhead and is typically about 10-30x faster on this CPU-heavy path; the exact speedup depends on the model and machine.
+Use `maturin develop` for quick binding development and tests, but rebuild with `maturin develop --release --features extension-module,cpu-only` before real training. Release mode removes Rust debug-build overhead and is typically about 10-30x faster on this CPU-heavy path; the exact speedup depends on the model and machine.
 
 Choose plain SGD with `--optimizer sgd`. For Adam, `--weight-decay` applies decoupled AdamW weight decay.
 
