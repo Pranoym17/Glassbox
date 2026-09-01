@@ -94,6 +94,7 @@ pub fn event_channel(capacity: usize) -> (EventEmitter, Receiver<String>) {
 pub const DEFAULT_PORT: u16 = 8080;
 const INDEX_HTML: &str = include_str!("../visualizer/index.html");
 const APP_JS: &str = include_str!("../visualizer/app.js");
+const D3_JS: &str = include_str!("../visualizer/vendor/d3.v7.9.0.min.js");
 const STEP_JSON: &str = include_str!("../visualizer/fixtures/step.json");
 const TINY_STEP_JSON: &str = include_str!("../visualizer/fixtures/tiny_step.json");
 
@@ -211,6 +212,7 @@ fn handle_connection(mut stream: TcpStream, clients: &Arc<Mutex<Vec<TcpStream>>>
     let asset = match path {
         "/" | "/index.html" => Some((INDEX_HTML, "text/html; charset=utf-8")),
         "/app.js" => Some((APP_JS, "text/javascript; charset=utf-8")),
+        "/vendor/d3.v7.9.0.min.js" => Some((D3_JS, "text/javascript; charset=utf-8")),
         "/fixtures/step.json" => Some((STEP_JSON, "application/json")),
         "/fixtures/tiny_step.json" => Some((TINY_STEP_JSON, "application/json")),
         _ => None,
@@ -327,6 +329,16 @@ mod tests {
         page.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("<script type=\"module\" src=\"app.js\">"));
+        assert!(response.contains("<script src=\"vendor/d3.v7.9.0.min.js\">"));
+
+        let mut d3 = TcpStream::connect(server.address()).unwrap();
+        d3.write_all(b"GET /vendor/d3.v7.9.0.min.js HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        d3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut d3_response = String::new();
+        d3.read_to_string(&mut d3_response).unwrap();
+        assert!(d3_response.contains("Content-Type: text/javascript"));
+        assert!(d3_response.contains("d3js.org v7.9.0"));
 
         let mut fixture = TcpStream::connect(server.address()).unwrap();
         fixture

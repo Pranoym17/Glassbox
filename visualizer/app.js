@@ -590,7 +590,7 @@ function startBrowser() {
   }
 
   if (!d3) {
-    showError("D3 v7 failed to load; check the CDN connection.");
+    showError("The bundled D3 v7 asset failed to load.");
     return;
   }
   elements["load-tiny"].onclick = () => {
