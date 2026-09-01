@@ -146,6 +146,8 @@ impl PyTensor {
             let output = {
                 let mut tape = graph.tape.borrow_mut();
                 match operation {
+                    "exp" => tape.exp(input),
+                    "log" => tape.log(input),
                     "relu" => tape.relu(input),
                     "sigmoid" => tape.sigmoid(input),
                     "tanh" => tape.tanh(input),
@@ -156,6 +158,8 @@ impl PyTensor {
             Self::from_graph(graph, output)
         } else {
             let output = match operation {
+                "exp" => self.inner.exp(),
+                "log" => self.inner.log(),
                 "relu" => self.inner.relu(),
                 "sigmoid" => self.inner.sigmoid(),
                 "tanh" => self.inner.tanh(),
@@ -206,6 +210,14 @@ impl PyTensor {
         self.binary_op(other, "matmul")
     }
 
+    fn exp(&self) -> PyResult<Self> {
+        self.unary_op("exp")
+    }
+
+    fn log(&self) -> PyResult<Self> {
+        self.unary_op("log")
+    }
+
     fn relu(&self) -> PyResult<Self> {
         self.unary_op("relu")
     }
@@ -230,6 +242,7 @@ impl PyTensor {
             .map_err(value_error)
     }
 
+    /// Seeds non-scalar outputs with ones, backpropagating their element sum.
     fn backward(&self) -> PyResult<()> {
         let (graph, id) = match (&self.graph, self.id) {
             (Some(graph), Some(id)) => (graph, id),

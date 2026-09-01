@@ -527,6 +527,7 @@ impl Tape {
             output,
         ))
     }
+    /// Seeds non-scalar outputs with ones, backpropagating their element sum.
     pub fn backward(&self, loss: TensorId) -> Result<HashMap<TensorId, Tensor>, TapeError> {
         let mut seen = HashSet::new();
         let mut order = vec![];

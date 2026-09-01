@@ -200,12 +200,10 @@ fn handle_connection(mut stream: TcpStream, clients: &Arc<Mutex<Vec<TcpStream>>>
     let path = request.split_whitespace().nth(1).unwrap_or("/");
     if path == "/events" {
         let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+        let mut clients = clients.lock().expect("visualizer clients lock poisoned");
         if stream.write_all(headers.as_bytes()).is_ok() {
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-            clients
-                .lock()
-                .expect("visualizer clients lock poisoned")
-                .push(stream);
+            clients.push(stream);
         }
         return;
     }
