@@ -50,6 +50,21 @@ export function firstSequence(events) {
   });
 }
 
+export function connectionLabel(state, step = null) {
+  switch (state) {
+    case "connecting":
+      return "connecting";
+    case "connected":
+      return "connected - waiting for first event";
+    case "live":
+      return step === null ? "live" : `live - receiving step ${step}`;
+    case "reconnecting":
+      return "reconnecting - partial step discarded";
+    default:
+      throw new Error(`unknown connection state: ${state}`);
+  }
+}
+
 export function buildGraph(events) {
   const nodes = new Map();
   const edges = new Map();
@@ -560,15 +575,15 @@ function startBrowser() {
     }
     clearTimeout(state.liveTimer);
     state.liveTimer = null;
-    elements.connection.textContent = "connecting";
+    elements.connection.textContent = connectionLabel("connecting");
     const source = new EventSource("/events");
     state.liveSource = source;
     source.onopen = () => {
-      elements.connection.textContent = "live";
+      elements.connection.textContent = connectionLabel("connected");
       elements["connect-live"].textContent = "reconnect";
     };
     source.onerror = () => {
-      elements.connection.textContent = "reconnecting - partial step discarded";
+      elements.connection.textContent = connectionLabel("reconnecting");
       state.live.reconnect();
       clearTimeout(state.liveTimer);
       state.liveTimer = null;
@@ -578,7 +593,7 @@ function startBrowser() {
         const event = JSON.parse(message.data);
         const completed = state.live.push(event);
         if (completed) commitLive(completed);
-        elements.connection.textContent = `receiving step ${event.step}`;
+        elements.connection.textContent = connectionLabel("live", event.step);
         clearTimeout(state.liveTimer);
         if (event.phase === "backward") {
           state.liveTimer = setTimeout(finishLive, 500);

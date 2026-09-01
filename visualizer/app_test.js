@@ -1,5 +1,6 @@
 import {
   buildGraph,
+  connectionLabel,
   firstSequence,
   graphAssertions,
   LiveStepBuffer,
@@ -24,6 +25,19 @@ function distinctIds(events) {
   });
   return ids;
 }
+
+Deno.test("connection label waits for the first real event", () => {
+  const connected = connectionLabel("connected");
+  assert(
+    connected === "connected - waiting for first event",
+    "open SSE connection claimed to be live",
+  );
+  assert(!connected.includes("live"), "connected state contains live");
+  assert(
+    connectionLabel("live", 50) === "live - receiving step 50",
+    "first event did not switch the connection to live",
+  );
+});
 
 Deno.test("tiny fixture is a complete acyclic step", async () => {
   const events = await fixture("tiny_step.json");
