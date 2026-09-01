@@ -24,7 +24,9 @@ pub fn softmax(x: &Tensor) -> Result<Tensor, TensorError> {
     Tensor::from_vec(vec![r, c], o)
 }
 pub fn softmax_backward(s: &Tensor, dy: &Tensor) -> Result<Tensor, TensorError> {
-    let (r, c) = dims(s)?;
+    let s = s.contiguous();
+    let dy = dy.contiguous();
+    let (r, c) = dims(&s)?;
     if s.shape() != dy.shape() {
         return Err(TensorError::IncompatibleShapes {
             left: s.shape().to_vec(),
@@ -93,6 +95,20 @@ mod tests {
         let actual = softmax(&view).unwrap();
         assert!(actual.is_close(&expected, 1e-6, 1e-6).unwrap());
     }
+    #[test]
+    fn softmax_backward_materializes_non_contiguous_inputs() {
+        let probabilities =
+            Tensor::from_vec(vec![3, 2], vec![0.2, 0.1, 0.3, 0.6, 0.5, 0.3]).unwrap();
+        let upstream = Tensor::from_vec(vec![3, 2], vec![0.7, -0.2, 0.4, 0.9, -0.5, 0.1]).unwrap();
+        let probabilities = probabilities.permute(&[1, 0]).unwrap();
+        let upstream = upstream.permute(&[1, 0]).unwrap();
+        assert!(!probabilities.is_contiguous());
+        assert!(!upstream.is_contiguous());
+        let expected =
+            softmax_backward(&probabilities.contiguous(), &upstream.contiguous()).unwrap();
+        let actual = softmax_backward(&probabilities, &upstream).unwrap();
+        assert!(actual.is_close(&expected, 1e-6, 1e-6).unwrap());
+    }
 }
 #[derive(Clone, Debug)]
 pub struct LayerNormContext {
@@ -145,7 +161,10 @@ pub fn layer_norm_backward(
     gamma: &Tensor,
     eps: f32,
 ) -> Result<(Tensor, Tensor, Tensor), TensorError> {
-    let (r, c) = dims(dy)?;
+    let dy = dy.contiguous();
+    let gamma = gamma.contiguous();
+    let normalized = ctx.normalized.contiguous();
+    let (r, c) = dims(&dy)?;
     let mut dx = vec![0.; r * c];
     let mut dg = vec![0.; c];
     let mut db = vec![0.; c];
@@ -156,14 +175,13 @@ pub fn layer_norm_backward(
         for j in 0..c {
             let q = dy.data()[i * c + j] * gamma.data()[j];
             a += q;
-            b += q * ctx.normalized.data()[i * c + j];
-            dg[j] += dy.data()[i * c + j] * ctx.normalized.data()[i * c + j];
+            b += q * normalized.data()[i * c + j];
+            dg[j] += dy.data()[i * c + j] * normalized.data()[i * c + j];
             db[j] += dy.data()[i * c + j]
         }
         for j in 0..c {
             let q = dy.data()[i * c + j] * gamma.data()[j];
-            dx[i * c + j] =
-                inv * (q - a / c as f32 - ctx.normalized.data()[i * c + j] * b / c as f32)
+            dx[i * c + j] = inv * (q - a / c as f32 - normalized.data()[i * c + j] * b / c as f32)
         }
     }
     Ok((
@@ -253,7 +271,35 @@ mod layer_tests {
         assert_eq!(actual_context.mean, expected_context.mean);
         assert_eq!(actual_context.variance, expected_context.variance);
     }
+    #[test]
+    fn layer_norm_backward_materializes_non_contiguous_inputs() {
+        let normalized =
+            Tensor::from_vec(vec![3, 2], vec![-1.0, 0.2, 0.0, -0.3, 1.0, 0.1]).unwrap();
+        let upstream = Tensor::from_vec(vec![3, 2], vec![0.7, -0.2, 0.4, 0.9, -0.5, 0.1]).unwrap();
+        let normalized = normalized.permute(&[1, 0]).unwrap();
+        let upstream = upstream.permute(&[1, 0]).unwrap();
+        let gamma = Tensor::from_vec(vec![3], vec![1.0, 0.7, 1.2]).unwrap();
+        let context = LayerNormContext {
+            normalized: normalized.clone(),
+            mean: vec![0.0, 0.0],
+            variance: vec![0.8, 1.1],
+        };
+        let contiguous_context = LayerNormContext {
+            normalized: normalized.contiguous(),
+            mean: context.mean.clone(),
+            variance: context.variance.clone(),
+        };
+        assert!(!context.normalized.is_contiguous());
+        assert!(!upstream.is_contiguous());
+        let expected =
+            layer_norm_backward(&upstream.contiguous(), &contiguous_context, &gamma, 1e-5).unwrap();
+        let actual = layer_norm_backward(&upstream, &context, &gamma, 1e-5).unwrap();
+        assert!(actual.0.is_close(&expected.0, 1e-6, 1e-6).unwrap());
+        assert!(actual.1.is_close(&expected.1, 1e-6, 1e-6).unwrap());
+        assert!(actual.2.is_close(&expected.2, 1e-6, 1e-6).unwrap());
+    }
 }
+
 pub fn causal_attention_tape(
     tape: &mut Tape,
     q: TensorId,
