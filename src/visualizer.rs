@@ -330,6 +330,8 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("<script type=\"module\" src=\"app.js\">"));
         assert!(response.contains("<script src=\"vendor/d3.v7.9.0.min.js\">"));
+        assert!(response.contains("<span id=\"connection\">connecting</span>"));
+        assert!(!response.contains("fixture mode"));
 
         let mut d3 = TcpStream::connect(server.address()).unwrap();
         d3.write_all(b"GET /vendor/d3.v7.9.0.min.js HTTP/1.1\r\nHost: localhost\r\n\r\n")
