@@ -213,6 +213,29 @@ impl Tape {
             .unwrap_or(0);
         Ok(())
     }
+    pub fn retain_leaves(&mut self, retained: &[TensorId]) -> Result<(), TapeError> {
+        let mut seen = HashSet::new();
+        let mut entries = Vec::with_capacity(retained.len());
+        let mut index = HashMap::with_capacity(retained.len());
+        let mut values = HashMap::with_capacity(retained.len());
+        for &id in retained {
+            if !seen.insert(id) {
+                continue;
+            }
+            let entry = self.entry(id)?.clone();
+            if entry.op != OpType::Leaf {
+                return Err(TapeError::NonLeafUpdate(id));
+            }
+            let value = self.value(id)?.clone();
+            index.insert(id, entries.len());
+            entries.push(entry);
+            values.insert(id, value);
+        }
+        self.entries = entries;
+        self.index = index;
+        self.values = values;
+        Ok(())
+    }
     /// Creates a new leaf that shares the value but has no edge to the source graph.
     pub fn detach(&mut self, input: TensorId) -> Result<TensorId, TapeError> {
         let value = self.value(input)?.detach();
@@ -1259,6 +1282,29 @@ mod tests {
         assert_eq!(tape.value(right).unwrap().data(), &[2.0]);
         assert!(matches!(tape.value(sum), Err(TapeError::UnknownTensor(id)) if id == sum));
     }
+    #[test]
+    fn retain_leaves_compacts_dynamic_graph_without_reusing_ids() {
+        let mut tape = Tape::new();
+        let parameter = tape.leaf(Tensor::from_vec(vec![1], vec![2.0]).unwrap());
+        let input = tape.leaf(Tensor::from_vec(vec![1], vec![3.0]).unwrap());
+        let output = tape.mul(parameter, input).unwrap();
+
+        tape.retain_leaves(&[parameter]).unwrap();
+        assert_eq!(tape.entry_count(), 1);
+        assert_eq!(tape.value(parameter).unwrap().data(), &[2.0]);
+        assert!(matches!(
+            tape.value(input),
+            Err(TapeError::UnknownTensor(id)) if id == input
+        ));
+        assert!(matches!(
+            tape.value(output),
+            Err(TapeError::UnknownTensor(id)) if id == output
+        ));
+
+        let next = tape.leaf(Tensor::from_vec(vec![1], vec![4.0]).unwrap());
+        assert!(next > output);
+    }
+
     fn traced_add(
         emitter: Option<EventEmitter>,
         enabled: bool,

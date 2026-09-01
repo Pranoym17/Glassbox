@@ -38,3 +38,4 @@ jobs:
           python -m pip install --upgrade pip maturin
           maturin develop --features extension-module,cpu-only
           python python/tests/test_smoke.py
+          python python/tests/test_composed_memory.py

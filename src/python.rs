@@ -22,6 +22,7 @@ fn value_error(error: impl Display) -> PyErr {
 struct PythonGraph {
     tape: RefCell<Tape>,
     gradients: RefCell<HashMap<TensorId, Tensor>>,
+    parameters: RefCell<Vec<TensorId>>,
 }
 
 impl PythonGraph {
@@ -29,7 +30,24 @@ impl PythonGraph {
         Self {
             tape: RefCell::new(Tape::new()),
             gradients: RefCell::new(HashMap::new()),
+            parameters: RefCell::new(Vec::new()),
         }
+    }
+
+    fn register_parameters(&self, ids: &[TensorId]) {
+        let mut parameters = self.parameters.borrow_mut();
+        for &id in ids {
+            if !parameters.contains(&id) {
+                parameters.push(id);
+            }
+        }
+    }
+
+    fn reset(&self) -> PyResult<()> {
+        self.tape
+            .borrow_mut()
+            .retain_leaves(&self.parameters.borrow())
+            .map_err(value_error)
     }
 }
 
@@ -349,6 +367,7 @@ impl PyLinear {
             &mut initializer,
         )
         .map_err(value_error)?;
+        graph.register_parameters(&layer.parameters());
         Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self { graph, layer }))
     }
 
@@ -380,6 +399,7 @@ impl PyLayerNorm {
         let graph = default_graph();
         let layer = RustLayerNorm::new(&mut graph.tape.borrow_mut(), features, epsilon)
             .map_err(value_error)?;
+        graph.register_parameters(&layer.parameters());
         Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self { graph, layer }))
     }
 
@@ -417,6 +437,7 @@ impl PyEmbedding {
             &mut initializer,
         )
         .map_err(value_error)?;
+        graph.register_parameters(&layer.parameters());
         Ok(PyClassInitializer::from(PyModuleBase).add_subclass(Self { graph, layer }))
     }
 
@@ -505,9 +526,10 @@ impl PyAdam {
             .map_err(value_error)
     }
 
-    fn zero_grad(&self) {
+    fn zero_grad(&self) -> PyResult<()> {
         self.optimizer
             .zero_grad(&mut self.graph.gradients.borrow_mut());
+        self.graph.reset()
     }
 }
 
@@ -541,9 +563,10 @@ impl PySgd {
             .map_err(value_error)
     }
 
-    fn zero_grad(&self) {
+    fn zero_grad(&self) -> PyResult<()> {
         self.optimizer
             .zero_grad(&mut self.graph.gradients.borrow_mut());
+        self.graph.reset()
     }
 }
 
