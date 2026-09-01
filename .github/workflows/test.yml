@@ -20,6 +20,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2.x"
+      - name: Test visualizer logic
+        run: deno test --allow-read visualizer/app_test.js
       - name: Check formatting
         run: cargo fmt --check
       - name: Test CPU and autograd paths
