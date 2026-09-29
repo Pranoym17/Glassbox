@@ -24,3 +24,4 @@ target/
 .venv/
 artifacts/*.gbx
 runs/
+brag-output*/

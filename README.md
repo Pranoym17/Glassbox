@@ -4,7 +4,9 @@
 
 Glassbox makes the machinery behind model training inspectable: tensors, broadcasting, a reverse-mode autograd tape, transformer operations, optimizers, checkpointing, sampling, hand-written GPU kernels, and a live graph of the forward and backward passes. The model trains on TinyShakespeare through the Rust CPU tape, while a separate CUDA library exercises the core GPU programming problems—launch geometry, reductions, shared memory, numerical stability, and host/device transfer—against trusted CPU references.
 
-> **Demo:** Video/GIF placeholder — add the recorded Glassbox walkthrough here.
+## Demo
+
+https://github.com/user-attachments/assets/c0710580-3ae9-4f39-bbcd-6570d92024cb
 
 ## What's inside
 
